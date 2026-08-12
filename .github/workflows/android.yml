@@ -51,19 +51,9 @@ jobs:
         with:
           name: app-standard-debug.apk
           path: /home/runner/work/MNN/MNN/apps/Android/MnnLlmChat/app/build/outputs/apk/standard/debug/app-standard-debug.apk
-          retention-days: 1 # 单独指定该工件仅保留1天
+          retention-days: 1 # 单独指定该文件仅保留1天
 
-      - name: 获取工件下载链接
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: "获取工作流 ID"
         run: |
           # 查询当前工作流的所有工件
-          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
-
-          echo "======响应结果======"
-          echo $RESPONSE
-          echo "==================="
-
-          # 提取指定名称工件的下载URL
-          DOWNLOAD_URL=$(echo $RESPONSE | jq -r '.artifacts[] | select(.name=="my-artifact") | .archive_download_url')
-          echo "精确下载链接: $DOWNLOAD_URL"
+          echo "工作流 ID \n${{ github.run_id }}"
