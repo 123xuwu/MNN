@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: build_android_64
+      - name: "编译并 apk"
         run: |
             cd project/android
             mkdir build_64
@@ -41,10 +41,32 @@ jobs:
             sleep 1
             cd ../../../apps/Android/MnnLlmChat
             ./gradlew assembleStandardDebug
+            sleep 1
             ls app/build/outputs/apk/standard/debug/app-standard-debug.apk
-      - name: build_android_32
-        run: |
-            cd project/android
-            mkdir build_32
-            cd build_32
-            ../build_32.sh -DMNN_LOW_MEMORY=true -DMNN_CPU_WEIGHT_DEQUANT_GEMM=true -DMNN_BUILD_LLM=true -DMNN_SUPPORT_TRANSFORMER_FUSE=true -DLLM_SUPPORT_AUDIO=true -DMNN_BUILD_AUDIO=true -DLLM_SUPPORT_VISION=true -DMNN_BUILD_OPENCV=true -DMNN_IMGCODECS=true
+      - name: "上传 apk"
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-app-standard-debug.apk
+          path: app/build/outputs/apk/standard/debug/app-standard-debug.apk
+
+  upload-release:
+    name: upload_to_release
+    needs: [android_build]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: artifact-*
+        path: assert
+        merge-multiple: true
+
+    - name: show file
+      run: ls assert
+
+    - uses: xresloader/upload-to-github-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        file: assert/*.apk
+        tags: true
+        draft: true
