@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: "编译并 apk"
+      - name: "编译 apk"
         run: |
             cd project/android
             mkdir build_64
@@ -41,14 +41,14 @@ jobs:
             sleep 1
             cd ../../../apps/Android/MnnLlmChat
             ./gradlew assembleStandardDebug
-            sleep 1
-            pwd
-            ls app/build/outputs/apk/standard/debug/app-standard-debug.apk
+      - name: "扫描 apk"
+        run: |
+          find . -name "*.apk" -type f
       - name: "上传 apk"
         uses: actions/upload-artifact@v4
         with:
           name: artifact-app-standard-debug.apk
-          path: app/build/outputs/apk/standard/debug/app-standard-debug.apk
+          path: /home/runner/work/MNN/MNN/apps/Android/MnnLlmChat/app/build/outputs/apk/standard/debug/app-standard-debug.apk
 
   upload-release:
     name: upload_to_release
