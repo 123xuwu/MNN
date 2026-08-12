@@ -42,6 +42,7 @@ jobs:
             cd ../../../apps/Android/MnnLlmChat
             ./gradlew assembleStandardDebug
             sleep 1
+            pwd
             ls app/build/outputs/apk/standard/debug/app-standard-debug.apk
       - name: "上传 apk"
         uses: actions/upload-artifact@v4
