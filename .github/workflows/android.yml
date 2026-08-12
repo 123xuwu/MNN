@@ -49,6 +49,7 @@ jobs:
         with:
           name: artifact-app-standard-debug.apk
           path: /home/runner/work/MNN/MNN/apps/Android/MnnLlmChat/app/build/outputs/apk/standard/debug/app-standard-debug.apk
+          retention-days: 1 # 单独指定该工件仅保留1天
 
   upload-release:
     name: upload_to_release
@@ -69,5 +70,3 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         file: assert/*.apk
-        tags: true
-        draft: true
