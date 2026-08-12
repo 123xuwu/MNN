@@ -1,13 +1,10 @@
     name: Sync Fork with Upstream
     on:
-      schedule:
-
+      # schedule:
         # 配置定时执行，这里设置为每天凌晨2点自动同步，可自行修改时间
-
-        - cron: '0 18 * * *'
+        # - cron: '0 18 * * *'
 
       # 支持手动触发同步
-
       workflow_dispatch:
 
     jobs:

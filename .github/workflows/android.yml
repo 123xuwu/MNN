@@ -41,32 +41,29 @@ jobs:
             sleep 1
             cd ../../../apps/Android/MnnLlmChat
             ./gradlew assembleStandardDebug
+
       - name: "扫描 apk"
         run: |
           find . -name "*.apk" -type f
+
       - name: "上传 apk"
         uses: actions/upload-artifact@v4
         with:
-          name: artifact-app-standard-debug.apk
+          name: app-standard-debug.apk
           path: /home/runner/work/MNN/MNN/apps/Android/MnnLlmChat/app/build/outputs/apk/standard/debug/app-standard-debug.apk
           retention-days: 1 # 单独指定该工件仅保留1天
 
-  upload-release:
-    name: upload_to_release
-    needs: [android_build]
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/download-artifact@v4
-      with:
-        pattern: artifact-*
-        path: assert
-        merge-multiple: true
+      - name: 获取工件下载链接
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 查询当前工作流的所有工件
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
 
-    - name: show file
-      run: ls assert
+          echo "======响应结果======"
+          echo $RESPONSE
+          echo "==================="
 
-    - uses: xresloader/upload-to-github-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        file: assert/*.apk
+          # 提取指定名称工件的下载URL
+          DOWNLOAD_URL=$(echo $RESPONSE | jq -r '.artifacts[] | select(.name=="my-artifact") | .archive_download_url')
+          echo "精确下载链接: $DOWNLOAD_URL"
