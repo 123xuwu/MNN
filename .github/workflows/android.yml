@@ -56,4 +56,4 @@ jobs:
       - name: "获取工作流 ID"
         run: |
           # 查询当前工作流的所有工件
-          echo "工作流 ID \n${{ github.run_id }}"
+          echo -e "工作流 ID \n${{ github.run_id }}"
