@@ -17,6 +17,12 @@
               token: ${{ secrets.GITHUB_TOKEN }}
               fetch-depth: 0
 
+          - name: 配置身份
+            run: |
+              # 先配置身份，再执行后续同步操作
+              git config --local user.email "action@github.com"
+              git config --local user.name "GitHub Action"
+
           - name: 添加上游仓库
             run: git remote add upstream https://github.com/alibaba/MNN
 
@@ -25,12 +31,6 @@
 
           - name: 合并上游变更到本地主分支
             run: git merge upstream/master --no-edit
-
-          - name: 配置身份
-            run: |
-              # 先配置身份，再执行后续同步操作
-              git config --local user.email "action@github.com"
-              git config --local user.name "GitHub Action"
 
             # 如果原项目主分支是master，将上面的main替换为master即可
 
