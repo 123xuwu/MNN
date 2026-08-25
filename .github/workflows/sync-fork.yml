@@ -26,6 +26,12 @@
           - name: 合并上游变更到本地主分支
             run: git merge upstream/master --no-edit
 
+          - name: 配置身份
+            run: |
+              # 先配置身份，再执行后续同步操作
+              git config --local user.email "action@github.com"
+              git config --local user.name "GitHub Action"
+
             # 如果原项目主分支是master，将上面的main替换为master即可
 
           - name: 推送同步后的代码到你的fork仓库
