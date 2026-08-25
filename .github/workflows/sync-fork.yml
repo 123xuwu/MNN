@@ -32,6 +32,7 @@ jobs:
         run: git fetch upstream master
 
       - name: "合并和处理 .github 目录"
+        id: check_changes
         run: |
           # 备份本地 .github 目录
           mv .github .github_backup
@@ -44,18 +45,21 @@ jobs:
           rm -rf .github
           mv .github_backup .github
 
-          git diff --quiet && git diff --staged --quiet
-
-          # 完成合并提交
           if git diff --quiet && git diff --staged --quiet; then
-            echo "没有新的同步更改"
-            exit 0
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "工作区和暂存区无任何未提交改动"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "检测到未提交的改动"
+            git diff
+            echo "======="
           fi
 
           git add .
           git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
 
       - name: 推送到远程和自动创建PR
+        if: steps.check_changes.outputs.has_changes == 'true'
         run: |
           # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
           PR_NAME="sync-upstream/$(date +%Y%m%d-%H%M)"
