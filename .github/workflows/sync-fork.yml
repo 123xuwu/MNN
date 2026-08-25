@@ -32,7 +32,7 @@ jobs:
           mv .github .github_backup
 
           # 合并上游变更
-          git merge upstream/master --no-commit
+          git merge upstream/master --no-commit --allow-unrelated-histories
           git status
 
           # 恢复自定义 .github 目录
