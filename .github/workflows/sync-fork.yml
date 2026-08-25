@@ -29,7 +29,7 @@ jobs:
       - name: 创建同步分支
         run: |
           git checkout -b sync-upstream
-          git merge upstream/master --no-edit || true # 自动合并，冲突保留待手动处理
+          git merge remotes/upstream/master --no-edit || true # 自动合并，冲突保留待手动处理
           git push origin sync-upstream -f
 
       - name: 自动创建同步PR
