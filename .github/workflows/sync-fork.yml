@@ -28,11 +28,6 @@ jobs:
 
       - name: 创建同步分支
         run: |
-          echo "查看分支"
-          git branch -a
-          echo "检测分支变更"
-          git log master..sync-upstream
-          echo "切换分支"
           git checkout -b sync-upstream
           git merge upstream/master --no-edit || true # 自动合并，冲突保留待手动处理
           git push origin sync-upstream -f
