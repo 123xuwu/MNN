@@ -43,10 +43,11 @@ jobs:
           # 恢复自定义 .github 目录
           rm -rf .github
           mv .github_backup .github
-          git status
+
+          git diff --quiet && git diff --staged --quiet
 
           # 完成合并提交
-          if git diff --cached --quiet; then
+          if git diff --quiet && git diff --staged --quiet; then
             echo "没有新的同步更改"
             exit 0
           fi
