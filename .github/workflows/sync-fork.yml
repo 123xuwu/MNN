@@ -33,8 +33,7 @@ jobs:
 
           # 合并上游变更
           echo 1
-          ls -a
-          git merge upstream/master --no-commit --allow-unrelated-histories
+          git merge -X theirs upstream/master --no-commit --allow-unrelated-histories
           git status
 
           echo 2
