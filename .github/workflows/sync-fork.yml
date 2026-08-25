@@ -1,72 +1,63 @@
-name: Sync Upstream & Auto Create PR
+name: Custom Sync Upstream (Preserve .github)
+
 on:
-  schedule:
-    - cron: '0 1 * * *' # 每日凌晨1点自动触发同步，可自定义时间
-  workflow_dispatch: # 支持手动在仓库页面触发同步操作
+  # schedule:
+  #   - cron: '0 0 * * *'
+  workflow_dispatch:  # 手动触发
 
 jobs:
-  sync-and-pr:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - name: 初始化Git用户配置
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: 拉取当前Fork仓库完整代码
+      - name: 检出当前代码
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.PAT }}
-          fetch-depth: 0
+          persist-credentials: true
+          ref: master
 
-      - name: 备份本地自定义的.github目录
-        run: mv .github .my_custom_github_backup
-
-      - name: 创建同步专用临时分支
-        run: git checkout -b sync-upstream
-
-      - name: 执行上游仓库同步
-        uses: tgymnich/fork-sync@v1.4
-        with:
-          github_token: ${{ secrets.PAT }}
-          owner: alibaba
-          repo: MNN # 替换为你的上游实际仓库名
-          base: master
-          head: sync-upstream # 同步到临时分支，不直接覆盖主分支
-          merge_method: merge
-
-      - name: 还原自定义.github + 清理多余文件
+      - name: "初始化 Git 配置"
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 清空同步过来的.github目录
+      - name: 添加上游远程
+        run: git remote add upstream https://github.com/alibaba/MNN.git
 
-          rm -rf .github
+      - name: 获取上游更改
+        run: git fetch upstream master
 
-          # 还原你本地备份的自定义.github文件
-
-          mv .my_custom_github_backup .github
-
-          # 删除当前仓库所有不在本次同步内容里的多余文件
-
-          git clean -fd
-
-      - name: 提交所有同步变更
+      - name: "合并和处理 .github 目录"
         run: |
-          git add .
-          git commit -m "chore: 同步上游master最新代码，保留本地自定义.github配置"
+          # 备份本地 .github 目录
+          mv .github .github_backup
 
-          # 强制推送临时分支到远程仓库
+          # 合并上游变更
+          git merge upstream/master --no-commit
+          git status
 
-          git push -f origin sync-upstream
+          # 恢复自定义 .github 目录
+          mv .github_backup .github
 
-      - name: 自动创建PR到主分支
-        uses: repo-sync/pull-request@v2
-        with:
-          source_branch: sync-upstream
-          destination_branch: master
-          github_token: ${{ secrets.PAT }}
-          pr_title: " 自动同步上游仓库最新代码"
-          pr_body: |
-            本次自动同步上游仓库master分支最新内容，已完整保留本地自定义的.github目录配置，已清理仓库中多余的未跟踪文件。
-            请检查变更内容后合并。
-          pr_label: "auto-sync"
+          # 完成合并提交
+          if git diff --cached --quiet; then
+            echo "没有新的同步更改"
+            exit 0
+          fi
+          git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
+
+      - name: 推送到远程和自动创建PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
+          PR_NAME="sync-upstream/$(date +%Y%m%d-%H%M)"
+          SYNC_BRANCH="sync-upstream"
+          git checkout -b $SYNC_BRANCH
+          git push origin -f $SYNC_BRANCH
+
+          # 调用GitHub CLI自动创建PR
+          gh pr create \
+            --base master \
+            --head $SYNC_BRANCH \
+            --title "自动同步上游 (${PR_NAME})" \
+            --body "来自 alibaba:master 上游的自动同步，`.github` 目录已被清理以保留本地自定义文件。"
