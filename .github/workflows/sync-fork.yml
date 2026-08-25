@@ -8,13 +8,11 @@ on:
   #   - cron: '0 0 * * *'
   workflow_dispatch:  # 手动触发
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.PAT }}
     steps:
       - name: 检出当前代码
         uses: actions/checkout@v4
@@ -56,8 +54,6 @@ jobs:
           git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
 
       - name: 推送到远程和自动创建PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
           PR_NAME="sync-upstream/$(date +%Y%m%d-%H%M)"
@@ -68,6 +64,6 @@ jobs:
           # 调用GitHub CLI自动创建PR
           gh pr create \
             --base master \
-            --head $SYNC_BRANCH \
+            --head "$SYNC_BRANCH" \
             --title "自动同步上游 (${PR_NAME})" \
-            --body "来自 alibaba:master 上游的自动同步，`.github` 目录已被清理以保留本地自定义文件。"
+            --body "来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。"
