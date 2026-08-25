@@ -38,5 +38,6 @@ jobs:
           github_token: ${{ secrets.PAT }}
           source_branch: "sync-upstream"
           destination_branch: "master"
-          pr_title: " 自动同步上游仓库最新更新"
+          pr_title: "自动同步上游仓库最新更新"
           pr_body: "本次自动拉取了上游master分支的全部提交，请检查变更后合并。"
+
