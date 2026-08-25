@@ -28,6 +28,9 @@ jobs:
 
       - name: 创建同步分支
         run: |
+          echo "检测分支变更"
+          git log master..sync-upstream
+          echo "切换分支"
           git checkout -b sync-upstream
           git merge upstream/master --no-edit || true # 自动合并，冲突保留待手动处理
           git push origin sync-upstream -f
@@ -41,3 +44,5 @@ jobs:
           pr_title: "自动同步上游仓库最新更新"
           pr_body: "本次自动拉取了上游master分支的全部提交，请检查变更后合并。"
 
+      - name: 输出PR错误信息
+        run: cat /tmp/pull-request.stderr.log
