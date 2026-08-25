@@ -9,6 +9,7 @@ on:
   workflow_dispatch:  # 手动触发
 
 permissions:
+  contents: write
   pull-requests: write
 
 jobs:
@@ -18,7 +19,7 @@ jobs:
       - name: 检出当前代码
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
+          persist-credentials: false
           ref: master
 
       - name: "初始化 Git 配置"
