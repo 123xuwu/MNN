@@ -43,6 +43,7 @@ jobs:
           # 恢复自定义 .github 目录
           rm -rf .github
           mv .github_backup .github
+          git status
 
           # 完成合并提交
           if git diff --cached --quiet; then
