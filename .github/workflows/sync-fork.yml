@@ -19,7 +19,7 @@ jobs:
       - name: 检出当前代码
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: true
           ref: master
 
       - name: "初始化 Git 配置"
