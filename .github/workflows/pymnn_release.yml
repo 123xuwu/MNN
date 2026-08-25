@@ -73,26 +73,7 @@ jobs:
         name: artifact-${{ matrix.os }}-${{ matrix.arch }}
         path: wheelhouse/*.whl
 
-  publish_wheels:
-    if: github.event_name == 'push' || inputs.publish_to_pypi
-    permissions:
-      contents: none
-      id-token: write
-    name: Upload
-    needs: [build_wheels]
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/setup-python@v4
-      with:
-        python-version: '3.x'
-
-    - uses: actions/download-artifact@v4
-      with:
-        pattern: artifact-*
-        path: dist
-        merge-multiple: true
-
-    - uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        skip_existing: true
+      - name: "获取工作流 ID"
+        run: |
+          # 查询当前工作流的所有工件
+          echo -e "工作流 ID \n${{ github.run_id }}"

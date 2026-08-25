@@ -1,16 +1,72 @@
-name: Sync Fork Upstream
+name: Sync Upstream & Auto Create PR
 on:
-  # schedule:
-  #   - cron: '0 */6 * * *'  # 每6小时自动执行一次，可自定义频率
-  workflow_dispatch: # 支持在Actions页面手动点击按钮触发同步
+  schedule:
+    - cron: '0 1 * * *' # 每日凌晨1点自动触发同步，可自定义时间
+  workflow_dispatch: # 支持手动在仓库页面触发同步操作
 
 jobs:
-  sync:
+  sync-and-pr:
     runs-on: ubuntu-latest
     steps:
-      - uses: tgymnich/fork-sync@v1.4
+      - name: 初始化Git用户配置
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取当前Fork仓库完整代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+
+      - name: 备份本地自定义的.github目录
+        run: mv .github .my_custom_github_backup
+
+      - name: 创建同步专用临时分支
+        run: git checkout -b sync-upstream
+
+      - name: 执行上游仓库同步
+        uses: tgymnich/fork-sync@v1.4
         with:
           github_token: ${{ secrets.PAT }}
-          owner: alibaba  # 比如上游仓库是123xuwu/MNN，这里填123xuwu
-          base: master          # 上游仓库的目标分支
-          head: master          # 你自己Fork仓库要同步的分支
+          owner: alibaba
+          repo: MNN # 替换为你的上游实际仓库名
+          base: master
+          head: sync-upstream # 同步到临时分支，不直接覆盖主分支
+          merge_method: merge
+
+      - name: 还原自定义.github + 清理多余文件
+        run: |
+
+          # 清空同步过来的.github目录
+
+          rm -rf .github
+
+          # 还原你本地备份的自定义.github文件
+
+          mv .my_custom_github_backup .github
+
+          # 删除当前仓库所有不在本次同步内容里的多余文件
+
+          git clean -fd
+
+      - name: 提交所有同步变更
+        run: |
+          git add .
+          git commit -m "chore: 同步上游master最新代码，保留本地自定义.github配置"
+
+          # 强制推送临时分支到远程仓库
+
+          git push -f origin sync-upstream
+
+      - name: 自动创建PR到主分支
+        uses: repo-sync/pull-request@v2
+        with:
+          source_branch: sync-upstream
+          destination_branch: master
+          github_token: ${{ secrets.PAT }}
+          pr_title: " 自动同步上游仓库最新代码"
+          pr_body: |
+            本次自动同步上游仓库master分支最新内容，已完整保留本地自定义的.github目录配置，已清理仓库中多余的未跟踪文件。
+            请检查变更内容后合并。
+          pr_label: "auto-sync"
