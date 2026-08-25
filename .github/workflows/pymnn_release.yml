@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_to_pypi:
-        description: Publish wheels to PyPI after a successful build
+        description: 成功构建后，将wheels发布到PyPI
         required: false
         type: boolean
         default: false
