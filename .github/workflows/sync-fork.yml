@@ -1,9 +1,17 @@
 name: Custom Sync Upstream (Preserve .github)
 
 on:
+  push:
+    paths:
+      - '.github/workflows/sync_fork.yml'
   # schedule:
   #   - cron: '0 0 * * *'
   workflow_dispatch:  # 手动触发
+
+permissions:
+  issues: write
+  pull-requests: write
+  workflows: write
 
 jobs:
   sync:
@@ -32,12 +40,11 @@ jobs:
           mv .github .github_backup
 
           # 合并上游变更
-          echo 1
           git merge -X theirs upstream/master --no-commit --allow-unrelated-histories
           git status
 
-          echo 2
           # 恢复自定义 .github 目录
+          rm -rf .github
           mv .github_backup .github
 
           # 完成合并提交
@@ -45,13 +52,11 @@ jobs:
             echo "没有新的同步更改"
             exit 0
           fi
-          echo 3
+
           git add .
           git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
 
       - name: 推送到远程和自动创建PR
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
           # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
           PR_NAME="sync-upstream/$(date +%Y%m%d-%H%M)"
