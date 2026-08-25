@@ -73,7 +73,7 @@ jobs:
         name: artifact-${{ matrix.os }}-${{ matrix.arch }}
         path: wheelhouse/*.whl
 
-      - name: "获取工作流 ID"
-        run: |
-          # 查询当前工作流的所有工件
-          echo -e "工作流 ID \n${{ github.run_id }}"
+    - name: "获取工作流 ID"
+      run: |
+        # 查询当前工作流的所有工件
+        echo -e "工作流 ID \n${{ github.run_id }}"
