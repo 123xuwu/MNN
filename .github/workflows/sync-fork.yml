@@ -72,8 +72,6 @@ jobs:
 
           echo "pr_title=$(PR_NAME)" >> $GITHUB_OUTPUT
 
-      # 03. 调用create-pull-request@v7，传入动态生成的标题
-
       - name: 创建同步PR
         if: steps.check_changes.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@v7
@@ -82,6 +80,5 @@ jobs:
           commit-message: feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹
           branch: ${{ steps.sync_time.outputs.pr_title }} # 分支名也可以复用时间戳避免重复
           title: 自动同步上游-${{ steps.sync_time.outputs.pr_title }} # 直接引用生成的标题变量
-          body: |
-            来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。
+          body: 来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。
           delete-branch: true # PR合并后自动删除临时分支
