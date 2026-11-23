@@ -77,5 +77,5 @@ jobs:
             --head "$SYNC_BRANCH" \
             --title "自动同步上游 (${PR_NAME})" \
             --body "来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。"
-        # env:
-        #   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
