@@ -15,8 +15,8 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # env:
-    #   GITHUB_TOKEN: ${{ secrets.PAT }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.PAT }}
     steps:
       - name: 检出当前代码
         uses: actions/checkout@v4
