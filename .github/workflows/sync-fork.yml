@@ -8,6 +8,10 @@ on:
   #   - cron: '0 0 * * *'
   workflow_dispatch:  # 手动触发
 
+permissions:
+  contents: write        # 允许推送分支、修改仓库内容
+  pull-requests: write   # 允许创建和管理 PR
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -73,3 +77,5 @@ jobs:
             --head "$SYNC_BRANCH" \
             --title "自动同步上游 (${PR_NAME})" \
             --body "来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。"
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
