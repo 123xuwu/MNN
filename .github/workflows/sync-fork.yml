@@ -4,13 +4,11 @@ on:
   push:
     paths:
       - '.github/workflows/sync-fork.yml'
-  # schedule:
-  #   - cron: '0 0 * * *'
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write        # 允许推送分支、修改仓库内容
-  pull-requests: write   # 允许创建和管理 PR
+  contents: write
+  pull-requests: write
 
 env:
   GITHUB_TOKEN: ${{ secrets.PAT }}
@@ -27,10 +25,11 @@ jobs:
       - name: 检出当前代码
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
           ref: master
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: "初始化 Git 配置"
+      - name: 初始化 Git 配置
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -41,55 +40,61 @@ jobs:
       - name: 获取上游更改
         run: git fetch upstream master
 
-      - name: "合并和处理 .github 目录"
-        id: check_changes
+      - name: 检查是否有需要同步的上游变更
+        id: upstream_check
         run: |
-          # 备份本地 .github 目录
-          mv .github .github_backup
-
-          # 合并上游变更
-          git merge -X theirs upstream/master --no-commit --allow-unrelated-histories
-          echo "变更数量"
-          git status | wc -l
-
-          # 恢复自定义 .github 目录
-          rm -rf .github
-          mv .github_backup .github
-
-          if git diff --quiet && git diff --staged --quiet; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "工作区和暂存区无任何未提交改动"
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "upstream/master 已被当前 master 包含，无需同步"
+            echo "upstream_ahead=false" >> "$GITHUB_OUTPUT"
           else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "检测到未提交的改动"
-            git diff
-            echo "======="
+            echo "发现上游新提交："
+            git log --oneline HEAD..upstream/master | head
+            echo "upstream_ahead=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 推送到远程和设置创建时间
-        if: steps.check_changes.outputs.has_changes == 'true'
-        id: sync_time
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+      - name: 合并上游并保留 .github
+        id: merge_changes
+        if: steps.upstream_check.outputs.upstream_ahead == 'true'
         run: |
-          # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
-          sudo timedatectl set-timezone Asia/Shanghai
-          PR_NAME="sync-upstream/$(date +%Y-%m-%d_%H-%M)"
-          git checkout -b $PR_NAME
-          git add .
-          git commit -m "feat: 同步上游 alibaba:master"
-          git push origin -f $PR_NAME
-          # 设置创建时间分支
-          echo "pr_title=${PR_NAME}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          cp -a .github .github_backup
+
+          git merge --no-commit upstream/master
+
+          rm -rf .github
+          mv .github_backup .github
+          rm -rf .github_backup
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "合并后没有实际差异"
+            git merge --abort || git reset --merge
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "feat: 同步上游 alibaba:master，保留自定义 .github"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 推送同步分支
+        id: push_branch
+        if: steps.upstream_check.outputs.upstream_ahead == 'true' && steps.merge_changes.outputs.has_changes == 'true'
+        run: |
+          SYNC_BRANCH="sync-upstream"
+          git checkout -B "$SYNC_BRANCH"
+          git push origin -f "$SYNC_BRANCH"
+          echo "sync_branch=${SYNC_BRANCH}" >> "$GITHUB_OUTPUT"
 
       - name: 创建同步PR
-        if: steps.check_changes.outputs.has_changes == 'true'
+        if: steps.push_branch.conclusion == 'success'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.PAT }}
-          commit-message: "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
+          commit-message: "feat: 同步上游 alibaba:master，保留自定义 .github"
           base: master
-          branch: ${{ steps.sync_time.outputs.pr_title }} # 分支名也可以复用时间戳避免重复
-          title: 自动同步上游-${{ steps.sync_time.outputs.pr_title }} # 直接引用生成的标题变量
-          body: 来自 alibaba:master 上游的自动同步，.github 目录已被清理以保留本地自定义文件。
-          delete-branch: true # PR合并后自动删除临时分支
+          branch: ${{ steps.push_branch.outputs.sync_branch }}
+          title: 自动同步上游 alibaba:master
+          body: 来自 alibaba:master 的自动同步，保留本地 .github 自定义配置。
+          delete-branch: false
+          maintainer-can-modify: true
