@@ -78,8 +78,8 @@ jobs:
           git add .
           git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
           git push origin -f $PR_NAME
-
-          echo "pr_title=$(PR_NAME)" >> $GITHUB_OUTPUT
+          # 设置创建时间分支
+          echo "pr_title=${PR_NAME}" >> $GITHUB_OUTPUT
 
       - name: 创建同步PR
         if: steps.check_changes.outputs.has_changes == 'true'
