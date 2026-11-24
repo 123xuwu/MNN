@@ -3,7 +3,7 @@ name: Custom Sync Upstream (Preserve .github)
 on:
   push:
     paths:
-      - '.github/workflows/sync_fork.yml'
+      - '.github/workflows/sync-fork.yml'
   # schedule:
   #   - cron: '0 0 * * *'
   workflow_dispatch:  # 手动触发
@@ -72,11 +72,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
           # 创建带时间戳的同步分支，避免直接推主分支，更符合PR规范
-           sudo timedatectl set-timezone Asia/Shanghai
-          PR_NAME="sync-upstream/$(date +%Y-%m-%d-%H-%M)"
+          sudo timedatectl set-timezone Asia/Shanghai
+          PR_NAME="sync-upstream/$(date +%Y-%m-%d_%H-%M)"
+          git checkout -b $PR_NAME
           git add .
           git commit -m "feat: 同步上游 alibaba:master, 保留自定义 .github 文件夹"
-          git checkout -b $PR_NAME
           git push origin -f $PR_NAME
 
           echo "pr_title=$(PR_NAME)" >> $GITHUB_OUTPUT
