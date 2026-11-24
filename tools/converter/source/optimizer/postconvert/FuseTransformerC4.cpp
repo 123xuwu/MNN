@@ -707,6 +707,17 @@ private:
         morph->main.value = fused.release();
         morph->inputIndexes = {members[morphPos].pre.convertOut};
         morph->outputIndexes = outputs;
+        // The member convs are deleted below, so record their names in convs
+        // order inside the op name. Downstream tooling (e.g. the split-LoRA
+        // exporter) uses this to map outputs[i] back to its projection.
+        std::string fusedName;
+        for (auto& member : members) {
+            if (!fusedName.empty()) {
+                fusedName += "+";
+            }
+            fusedName += mOps[member.convIdx]->name;
+        }
+        morph->name = std::move(fusedName);
         for (size_t i = 0; i < members.size(); ++i) {
             if (i == morphPos) {
                 continue;
@@ -727,8 +738,12 @@ private:
         bool changed = false;
         if (mFuseQkvProj) {
             changed |= fuseAttentionProjGroups();
-            changed |= fuseLinearAttentionProjGroups();
         }
+        // The LinearAttention runtime op only runs correctly when its
+        // qkv/z/b/a projections are C4-fused; unlike regular Attention it cannot
+        // consume raw (unfused) projection outputs, so this fusion is mandatory
+        // and must not be gated by the optional mFuseQkvProj flag.
+        changed |= fuseLinearAttentionProjGroups();
         if (mFuseGateUpProj) {
             changed |= fuseGateUpProjGroups();
         }

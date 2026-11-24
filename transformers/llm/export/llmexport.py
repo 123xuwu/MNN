@@ -3,6 +3,8 @@ import json
 import glob
 import warnings
 import argparse
+import tempfile
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -11,6 +13,7 @@ os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 import onnx
 import torch
 
+from utils.package_writer import pack_model, register_file_region
 from utils.model import LlmModel, EmbeddingModel
 from utils.tokenizer import LlmTokenizer
 from utils.spinner import spinner_run
@@ -20,6 +23,7 @@ from utils.mnn_converter import MNNConverter
 from utils.awq_quantizer import AwqQuantizer
 from utils.smooth_quantizer import SmoothQuantizer
 from utils.omni_quantizer import OmniQuantizer
+from utils.qat import QATLoader
 from utils.torch_utils import onnx_export
 
 
@@ -30,6 +34,7 @@ class LlmExporter(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
         self.init_from_args(args)
+        self.qat_loader = QATLoader(args.path, args) if getattr(args, 'qat', False) else None
         self.load_model(args.path)
 
     def init_from_args(self, args):
@@ -40,7 +45,7 @@ class LlmExporter(torch.nn.Module):
         self.dst_name = 'llm'
         self.exported_tokenizer_file = 'tokenizer.mtok'
         # load config from args
-        self.onnx_path = os.path.join(self.args.dst_path, 'onnx')
+        self.onnx_path = os.path.join(getattr(self.args, 'work_path', self.args.dst_path), 'onnx')
         if self.args.tokenizer_path is None:
             self.args.tokenizer_path = self.args.path
         if args.lm_quant_bit is None:
@@ -119,6 +124,11 @@ class LlmExporter(torch.nn.Module):
             attn = self.model.blocks[0].self_attn
             if hasattr(attn, 'attn_scaling') and attn.attn_scaling != 1.0 / (self.config.head_dim ** 0.5):
                 self.llm_config['attn_scale'] = attn.attn_scaling
+            num_kv_shared = sum(1 for b in self.model.blocks
+                                if getattr(b.self_attn, 'is_kv_shared_layer', False)
+                                and getattr(b.self_attn, 'kv_shared_layer_index', None) is not None)
+            if num_kv_shared > 0:
+                self.llm_config['num_kv_shared_layers'] = num_kv_shared
         if self.config.sliding_window > 0:
             self.llm_config['sliding_window'] = self.config.sliding_window
         if hasattr(self.tokenizer, 'get_chat_template'):
@@ -165,6 +175,9 @@ class LlmExporter(torch.nn.Module):
 
         # tie word embeddings
         self.args.tie_word_embeddings = not self.args.seperate_embed and self.model.lm.lm.weight.equal(self.model.embed.embed.weight)
+        if self.qat_loader is not None:
+            self.args.tie_word_embeddings = self.qat_loader.bind_tied_embeddings(
+                self.model.lm.lm, self.model.embed.embed, self.args.tie_word_embeddings)
         # Pass properties from model to exporter
         self.visual = self.model.visual
         self.audio = self.model.audio
@@ -177,7 +190,7 @@ class LlmExporter(torch.nn.Module):
     @torch.no_grad()
     def response(self, query):
         # self.imitate_quant()
-        self.model.decode_buffer = []
+        self.tokenizer.decode_buffer.clear()
         messages = [
             {"role": "user", "content": query}
         ]
@@ -226,13 +239,15 @@ class LlmExporter(torch.nn.Module):
             seq_len += 1
             new_tokens += 1
             if token_id in self.tokenizer.stop_ids:
-                print("", end='\n')
+                print(self.tokenizer.flush_decode_buffer(), end='\n')
                 break
 
             # Use tokenizer's method for decoding
             word = self.tokenizer.id_to_str(token_id)
             print(word, end="", flush=True)
             input_ids = token_id
+
+        print(self.tokenizer.flush_decode_buffer(), end="", flush=True)
 
         if hasattr(self.model, 'talker') and self.model.talker is not None:
             self.model.talker.generate()
@@ -250,7 +265,7 @@ class LlmExporter(torch.nn.Module):
             return
         from utils.eagle import Eagle
         self.eagle = Eagle.get_eagle(self.model_type)(self.args.eagle_path, self.model)
-        eagle_onnx, eagle_fc_onnx = self.eagle.export(self.onnx_path)
+        eagle_onnx, eagle_fc_onnx = self.eagle.export(self.onnx_path, self.args.dst_path)
         if self.mnn_converter:
             MNNConverter(self, None).export(eagle_onnx)
             MNNConverter(self, None).export(eagle_fc_onnx)
@@ -317,7 +332,7 @@ class LlmExporter(torch.nn.Module):
                 if file_size > 0:
                     f.seek(file_size - 1)
                     f.write(b'\0')
-            return embedding_file
+            return register_file_region(self.args, embedding_file)
 
         if format_bit == 16:
             # BF16 format
@@ -353,11 +368,11 @@ class LlmExporter(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported embedding bit precision: {format_bit}")
 
-        return embedding_file
+        return register_file_region(self.args, embedding_file)
 
     @spinner_run(f'export config to ')
     def export_config(self, mnn_config = False):
-        with open(f'{self.args.dst_path}/export_args.json', 'w', encoding='utf-8') as f:
+        with open(os.path.join(getattr(self.args, 'work_path', self.args.dst_path), 'export_args.json'), 'w', encoding='utf-8') as f:
             json.dump(self.args.__dict__, f, ensure_ascii=False, indent=4)
         config_json = f'{self.args.dst_path}/llm_config.json'
         with open(config_json, 'w', encoding='utf-8') as f:
@@ -388,6 +403,8 @@ class LlmExporter(torch.nn.Module):
                 "ngram_factor": 1.0
             }
             config['tokenizer_file'] = self.exported_tokenizer_file
+            if getattr(self.model, 'speech', None) is not None:
+                config.update(self.model.speech.get_generation_config())
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
             if hasattr(self, 'talker') and self.talker is not None:
@@ -456,9 +473,10 @@ class LlmExporter(torch.nn.Module):
             self.model.lm.lm = quant_dequant(self.model.lm.lm)
 
     def unload_param(self):
+        from utils.transformers import IndexedExperts
         self.unloaded_ops = {}
-        self.experts = []
-        self.expert_layer_ids = []
+        fuse_experts = (getattr(self.args, 'transformer_c4', True) and
+                        getattr(self.args, 'fuse_gate_up_proj', True) and not getattr(self.args, 'lora_split', False))
         def build_faker(real, name):
             faker = FakeLinear(real.in_features, real.out_features, real.bias is not None, name)
             self.unloaded_ops[name] = real.cpu()
@@ -492,12 +510,8 @@ class LlmExporter(torch.nn.Module):
                             setattr(self.model.blocks[i].mlp.shared_expert, name, build_faker(child, f'/layers.{i}/mlp/shared_expert/{name}/Linear'))
                 # MLP-level MoE experts
                 if is_moe and hasattr(self.model.blocks[i].mlp, 'experts') and isinstance(self.model.blocks[i].mlp.experts, torch.nn.ModuleList):
-                    self.experts.append(self.model.blocks[i].mlp.experts)
-                    self.expert_layer_ids.append(i)
-                    for j in range(len(self.model.blocks[i].mlp.experts)):
-                        for name, cchild in self.model.blocks[i].mlp.experts[j].named_children():
-                            if isinstance(cchild, torch.nn.Linear):
-                                setattr(self.model.blocks[i].mlp.experts[j], name, build_faker(cchild, f'/expert/{i}_{j}/{name}'))
+                    self.model.blocks[i].mlp.experts = IndexedExperts(
+                        self.model.blocks[i].mlp.experts, i, self.unloaded_ops, fuse_experts)
                 # gemma4 decoder-level MoE (parallel to dense MLP)
                 has_gemma4_moe = getattr(self.model.blocks[i], 'has_gemma4_moe', False)
                 if has_gemma4_moe:
@@ -506,13 +520,8 @@ class LlmExporter(torch.nn.Module):
                     child = self.model.blocks[i].moe_gate
                     if isinstance(child, torch.nn.Linear):
                         self.model.blocks[i].moe_gate = build_faker(child, f'/layers.{i}/moe_gate/Linear')
-                    # Unload experts
-                    self.experts.append(self.model.blocks[i].experts)
-                    self.expert_layer_ids.append(i)
-                    for j in range(len(self.model.blocks[i].experts)):
-                        for name, cchild in self.model.blocks[i].experts[j].named_children():
-                            if isinstance(cchild, torch.nn.Linear):
-                                setattr(self.model.blocks[i].experts[j], name, build_faker(cchild, f'/expert/{i}_{j}/{name}'))
+                    self.model.blocks[i].experts = IndexedExperts(
+                        self.model.blocks[i].experts, i, self.unloaded_ops, fuse_experts)
             self.model.lm.lm = build_faker(self.model.lm.lm, f'/lm/lm_head/Linear')
             # PLE model-level Linear (gemma4)
             if hasattr(self.model, 'per_layer_model_projection') and isinstance(self.model.per_layer_model_projection, torch.nn.Linear):
@@ -685,13 +694,13 @@ class LlmExporter(torch.nn.Module):
                     onnx_name = os.path.basename(onnx_path)
                     if onnx_name == 'talker.onnx':
                         weight_ops = getattr(self.talker, 'unloaded_ops', None)
-                    elif onnx_name == 'code_predictor.onnx' and hasattr(self.talker, 'code_predictor'):
-                        weight_ops = getattr(self.talker.code_predictor, 'unloaded_ops', None)
+                    elif onnx_name == 'code_predictor.onnx' and hasattr(self.talker, 'audio_code_predictor'):
+                        weight_ops = getattr(self.talker.audio_code_predictor, 'unloaded_ops', None)
                 converter = MNNConverter(self, weight_ops) if weight_ops is not None else self.mnn_converter
                 converter.export(onnx_path, self.talker.quant_bit)
                 if weight_ops is not None:
                     mnn_json = os.path.join(
-                        self.args.dst_path, os.path.basename(onnx_path).replace('.onnx', '.mnn.json'))
+                        getattr(self.args, 'work_path', self.args.dst_path), os.path.basename(onnx_path).replace('.onnx', '.mnn.json'))
                     if os.path.exists(mnn_json):
                         os.remove(mnn_json)
         if self.talker.token2wav is None:
@@ -733,6 +742,7 @@ class LlmExporter(torch.nn.Module):
             with open(ple_file, 'wb') as f:
                 f.write(buffer)
             self.llm_config['ple_embed_file'] = 'ple_embeddings_bf16.bin'
+        register_file_region(self.args, ple_file)
         self.llm_config['ple_embed_scale'] = embed_scale
         self.llm_config['ple_embed_dim'] = embed.embedding_dim
 
@@ -772,6 +782,10 @@ class LlmExporter(torch.nn.Module):
         self.export_talker()
         self.export_vision()
         self.export_audio()
+        if self.model.speech is not None:
+            for speech_onnx in self.model.speech.export(self.onnx_path):
+                if self.mnn_converter:
+                    self.mnn_converter.export(speech_onnx, 16)
         self.export_eagle()
         self.export_dflash()
         self.export_language()
@@ -970,7 +984,7 @@ class EmbeddingExporter(LlmExporter):
             # Fix MNN JSON: MNNConvert may swap batch and seq_len dims for input_ids,
             # producing e.g. [3, -1, 2048] instead of [1, -1, 2048]. With shapeMutable=true
             # the static dim 0 must be the batch dimension (1), not the traced seq_len (3).
-            llm_json = f'{self.args.dst_path}/llm.mnn.json'
+            llm_json = os.path.join(getattr(self.args, 'work_path', self.args.dst_path), 'llm.mnn.json')
             if os.path.exists(llm_json):
                 import json as _json
                 with open(llm_json) as f:
@@ -1007,10 +1021,12 @@ def build_args(parser):
     parser.add_argument('--dflash_path', type=str, default=None, help='dflash draft model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
+    parser.add_argument('--dst_file', metavar='FILE', help='write an uncompressed LLM package (e.g. model.mpack) with --export mnn')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
-    parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
+    parser.add_argument('--export', type=str, default=None, help='export model to onnx/mnn or package a compiled torq text model.')
+    parser.add_argument('--torq_model_dir', help='compiled A210 graph directory for --export torq; deploy it together with --dst_path')
     parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn weight bit, 2/3/4/8/16 (16 exports FP16 weights; 2 and 3 require ARMV86 i8mm + FP16), default is 4.')
     parser.add_argument('--quant_block', type=int, default=64, help='mnn quant block, 0 mean channel-wise, default is 64.')
@@ -1041,7 +1057,7 @@ def build_args(parser):
     parser.add_argument('--disable_fuse_linear_attn_gate', dest='fuse_linear_attn_gate', action='store_false',
                         help='Disable the linear-attention gate fold. Needed for engines predating gate_fold support: they ignore the flag and consume the raw `a` projection as the decay gate, which is wrong output rather than a load error.')
     parser.add_argument('--disable_fuse_qkv_proj', dest='fuse_qkv_proj', action='store_false', default=True,
-                        help='Do not let MNNConvert group shared-input q/k/v (and linear-attention) projections into one FusedLinear op.')
+                        help='Do not let MNNConvert group shared-input q/k/v projections of regular Attention into one FusedLinear op. (Linear-attention in_proj projections are always fused regardless of this flag, since the LinearAttention op requires C4-fused inputs.)')
     parser.add_argument('--disable_fuse_gate_up_proj', dest='fuse_gate_up_proj', action='store_false', default=True,
                         help='Do not let MNNConvert group dense SwiGLU gate/up projections into one FusedLinear op.')
     parser.add_argument('--disable_fuse_ln_proj', dest='fuse_ln_proj', action='store_false', default=True,
@@ -1051,6 +1067,8 @@ def build_args(parser):
     parser.add_argument('--embed_bit', type=int, default=16, choices=[16, 8, 4], help='embedding export bit precision, choices are 16 (bf16), 8 (int8), 4 (int4), default is 16.')
     parser.add_argument('--act_sym', action='store_true', help='smooth quant act us sym or not, default asym.')
     parser.add_argument('--quant_config', type=str, default=None, help='path to the JSON file for op-wise quantization configuration.')
+    parser.add_argument('--qat', action='store_true',
+                        help='Preserve QAT scale/zero_point from qat_config.json and safetensors.')
     parser.add_argument('--generate_for_npu', action='store_true', help='Whether or not to generate model for NPU deployment, default is False.')
     parser.add_argument('--skip_weight', action='store_true', help='Whether or not to skip loading model weights, useful for testing export flow.')
     # omni quant
@@ -1064,20 +1082,73 @@ def export(path, **kwargs):
     args = parser.parse_args(['--path', path])
     for k, v in kwargs.items():
         setattr(args, k, v)
-    if args.generate_for_npu:
-        args.transformer_c4 = False
-    embedding_models = ['bge', 'gte', 'Qwen3-Embedding', 'Qwen3-VL-Embedding']
-    if any(model in path for model in embedding_models):
-        llm_exporter = EmbeddingExporter(args)
-    else:
-        llm_exporter = LlmExporter(args)
-    # export
-    llm_exporter.export(args.export)
+    return run_export(args)
 
-def main():
-    parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
-    build_args(parser)
-    args = parser.parse_args()
+def _publish_split_lora(bundle, output, lora, lora_output):
+    # All split exports in this directory share one adapter, even with different base filenames.
+    publishing = output.parent / '.llmexport-lora'
+    publishing.mkdir()
+    previous = publishing / 'lora.mnn'
+    try:
+        if lora_output.is_dir():
+            raise IsADirectoryError(lora_output)
+        if os.path.lexists(lora_output):
+            os.replace(lora_output, previous)
+        try:
+            os.replace(lora, lora_output)
+            os.replace(bundle, output)
+        except OSError:
+            if os.path.lexists(previous):
+                os.replace(previous, lora_output)
+            elif not lora.exists():
+                lora_output.unlink()
+            raise
+        if os.path.lexists(previous):
+            previous.unlink()
+    finally:
+        # Keep the old adapter available for recovery if restoring it also failed.
+        if not os.path.lexists(previous):
+            publishing.rmdir()
+
+def run_export(args, cli=False):
+    if args.export == 'torq':
+        from runpy import run_path
+        exporter = Path(__file__).resolve().parents[1] / "engine" / "delegates" / "torq" / "export.py"
+        return run_path(str(exporter))["export_torq"](args)
+    if args.dst_file:
+        if args.export != 'mnn' or args.generate_for_npu:
+            raise ValueError('--dst_file requires --export mnn without --generate_for_npu')
+        output = Path(args.dst_file).absolute()
+        lora_output = output.parent / 'lora.mpack'
+        split_lora = args.lora_split and args.lora_path
+        if split_lora:
+            if output.name.casefold() == lora_output.name:
+                raise ValueError('--dst_file must differ from the split LoRA output lora.mpack')
+            if output.is_dir() or lora_output.is_dir():
+                raise ValueError('Split LoRA outputs must be files')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.llmexport-', dir=output.parent) as staging:
+            args.dst_path = os.path.join(staging, 'model')
+            args.work_path = os.path.join(staging, 'work')
+            args.file_regions = []
+            os.mkdir(args.dst_path)
+            os.mkdir(args.work_path)
+            run_exporter(args, cli)
+            if not split_lora:
+                return pack_model(args.dst_path, output, args.file_regions)
+            lora = Path(args.work_path) / 'lora.mnn'
+            if not lora.is_file() or lora.stat().st_size == 0:
+                raise ValueError('Split LoRA export did not produce a nonempty lora.mnn')
+            adapter = Path(staging) / 'adapter'
+            adapter.mkdir()
+            os.replace(lora, adapter / 'lora.mnn')
+            lora = Path(pack_model(adapter, Path(staging) / 'lora.mpack'))
+            bundle = pack_model(args.dst_path, Path(staging) / 'base.mpack', args.file_regions)
+            _publish_split_lora(bundle, output, lora, lora_output)
+            return str(output)
+    return run_exporter(args, cli)
+
+def run_exporter(args, cli):
     if args.generate_for_npu:
         args.transformer_c4 = False
 
@@ -1089,12 +1160,20 @@ def main():
     else:
         llm_exporter = LlmExporter(args)
 
-    # some actions
-    if args.test is not None:
+    if cli and args.test is not None:
         llm_exporter.response(args.test)
 
-    if args.export is not None:
-        llm_exporter.export(args.export)
+    if not cli or args.export is not None:
+        if llm_exporter.qat_loader is not None and args.export == 'mnn':
+            with llm_exporter.qat_loader.export_context():
+                llm_exporter.export(args.export)
+        else:
+            llm_exporter.export(args.export)
+
+def main():
+    parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
+    build_args(parser)
+    run_export(parser.parse_args(), cli=True)
 
 if __name__ == '__main__':
     main()

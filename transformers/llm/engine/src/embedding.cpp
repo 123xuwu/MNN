@@ -31,10 +31,23 @@ float Embedding::cos_sim(VARP var0, VARP var1) {
 }
 
 Embedding* Embedding::createEmbedding(const std::string& config_path, bool load) {
-    std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));
+    std::shared_ptr<LlmResources> resources;
+    std::shared_ptr<LlmConfig> config;
+    if (tryOpenLlmFile(config_path, resources)) {
+        if (!resources) {
+            return nullptr;
+        }
+        config.reset(new LlmConfig(std::move(resources)));
+        if (!config->config_.is_object()) {
+            return nullptr;
+        }
+    } else {
+        config.reset(new LlmConfig(config_path));
+    }
     Embedding* embedding = config->is_visual() ? static_cast<Embedding*>(new Omni(config)) : new Embedding(config);
-    if (load) {
-        embedding->load();
+    if (load && !embedding->load()) {
+        delete embedding;
+        return nullptr;
     }
     return embedding;
 }
@@ -50,17 +63,27 @@ bool Embedding::load() {
     MNN::Express::ExecutorScope s(mExecutor);
     if (mConfig->config_.value("load_disk_embedding_only", false)) {
         mDiskEmbedding.reset(new DiskEmbedding(mConfig));
+        if (!mDiskEmbedding->valid()) {
+            return false;
+        }
         return true;
     }
 
     initRuntime();
     // 1. load vocab
-    mTokenizer.reset(Tokenizer::createTokenizer(mConfig->tokenizer_file()));
+    mTokenizer.reset(Tokenizer::createTokenizer(mConfig->resource(mConfig->tokenizer_file())));
+    if (mTokenizer == nullptr) {
+        MNN_ERROR("[Error]: Failed to load tokenizer from: %s\n", mConfig->tokenizer_file().c_str());
+        return false;
+    }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
+    if (!mDiskEmbedding->valid()) {
+        return false;
+    }
     setChatTemplate();
     // 2. load model
     Module::Config module_config;
-    if(mConfig->backend_type() == "npu") {
+    if(mConfig->backend_type() == "npu" || mConfig->backend_type() == "qnn") {
         module_config.shapeMutable = false;
     } else {
         module_config.shapeMutable = true;
@@ -69,10 +92,8 @@ bool Embedding::load() {
     auto model_path            = mConfig->llm_model();
     auto weight_path = mConfig->llm_weight();
     MNN_PRINT("load %s ... ", model_path.c_str());
-    mRuntimeManager->setExternalFile(weight_path);
-    mModule.reset(Module::load({"input_ids", "attention_mask", "position_ids"}, {"sentence_embeddings"},
-                                   model_path.c_str(), mRuntimeManager, &module_config));
-    mRuntimeManager->setExternalFile("");
+    mModule.reset(mConfig->loadModule({"input_ids", "attention_mask", "position_ids"}, {"sentence_embeddings"},
+                                      model_path, mRuntimeManager, &module_config, weight_path));
     if (nullptr == mModule.get()) {
         return false;
     }
@@ -116,36 +137,12 @@ VARP Embedding::txt_embedding(const std::string& txt) {
 }
 
 VARP Embedding::gen_attention_mask(int seq_len) {
-    if (mConfig->attention_mask() == "float") {
-        // Standard lower-triangular causal mask. On backends that recognize the
-        // scalar sentinel (cpu/hexagon/metal, see Llm::gen_attention_mask /
-        // CPUAttention), emit a shape-empty float 0 instead of materializing the
-        // full seq*seq tensor -- this lets the attention op take the causal fast
-        // path (Metal causal-tri) and skips the O(seq^2) mask alloc/upload.
-        auto bt = mConfig->backend_type();
-        if (bt == "cpu" || bt == "hexagon" || bt == "metal") {
-            auto attention_mask = _Input({}, NCHW, halide_type_of<float>());
-            attention_mask->writeMap<float>()[0] = 0;
-            return attention_mask;
-        }
-        auto attention_mask = _Input({1, 1, seq_len, seq_len}, NCHW, halide_type_of<float>());
-        auto ptr = attention_mask->writeMap<float>();
-        for (int i = 0; i < seq_len; i++) {
-            for (int j = 0; j < seq_len; j++) {
-                ptr[seq_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
-            }
-        }
-        return attention_mask;
-    } else {
-        auto attention_mask = _Input({1, 1, seq_len, seq_len}, NCHW, halide_type_of<float>());
-        auto ptr = attention_mask->writeMap<float>();
-        for (int i = 0; i < seq_len; i++) {
-            for (int j = 0; j < seq_len; j++) {
-                ptr[seq_len * i + j] = 1.0;
-            }
-        }
-        return attention_mask;
-    }
+    MaskRequest req;
+    req.seqLen = seq_len;
+    req.rank   = 4;
+    // Embedding attention ops are exported with kv_cache=true, so the causal plane can be omitted.
+    req.type = mConfig->attention_mask() == "float" ? AttentionMaskType::Causal : AttentionMaskType::AllOnes;
+    return buildAttentionMask(req, mConfig->backend_type());
 }
 
 VARP Embedding::gen_position_ids(int seq_len) {

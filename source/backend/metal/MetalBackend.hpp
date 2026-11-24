@@ -25,6 +25,14 @@
 #include "MetalCache_generated.h"
 using namespace MetalCache;
 
+namespace MNN {
+// Flush the per-op GPU profile table (and the timeline CSV when
+// MNN_METAL_OP_PROFILE_TIMELINE is set) without waiting for process exit.
+// A no-op unless built with -DMNN_METAL_OP_PROFILE=ON; also defined when
+// MNN_METAL_ENABLED is off, so callers need no build-flag guard.
+void MetalOpProfileFlush();
+}
+
 #if MNN_METAL_ENABLED
 namespace MNN {
 
@@ -62,6 +70,21 @@ MetalCpuTrace& metalCpuTrace();
 enum MetalTuneLevel {Never = 0, Heavy = 1, Wide = 2, Normal = 3, Fast = 4};
 
 struct TunedInfo;
+
+// Layer 2 of the runtime device model: hardware identity. Fixed per chip,
+// unlike the layer-1 family queries, which also depend on the OS.
+struct MetalGpuInfo {
+    // Die tier (trailing letter of architecture.name), ordered by DRAM
+    // bandwidth class; route policy relies on this ordering with >= compares.
+    enum Tier { TierUnknown, TierPhone, TierBase, TierPro, TierMax, TierUltra };
+    int gen = 0;              // 0 = unknown
+    Tier tier = TierUnknown;
+    // Device-name prefix "Apple A". Needed apart from tier: recent phones
+    // carry an s-suffix die, so TierPro is phone OR Mac Pro/Studio, and only
+    // aSeries tells them apart (conv1x1 gate/up split-K gate uses it).
+    bool aSeries = false;
+};
+
 class MetalRuntime : public Runtime {
 public:
     friend class MetalBackend;
@@ -70,22 +93,30 @@ public:
     void *context() const {
         return mContext;
     }
+    // Device facts resolved once at init in three layers (see MetalRuntime
+    // ctor): (1) software capability, (2) hardware identity (MetalGpuInfo),
+    // (3) cross-op route policy. Per-op thresholds derive from gpuInfo().
+
+    // ---- Layer 1: software capability ----
     bool supportSimdGroupReduce() const {
         return mSimdGroupReduce;
     }
-    bool supportSimdGroupMatrix() {
+    bool supportSimdGroupMatrix() const {
         return mSimdGroupMatrix;
     }
-    bool supportTensorOps() {
-        return mTensorOps;
+
+    // ---- Layer 2: hardware identity ----
+    // Chip tiers key on layer 2 alone; layer-1 capabilities are checked at
+    // their own call site.
+    const MetalGpuInfo& gpuInfo() const {
+        return mGpuInfo;
     }
-    bool preferInShaderPrefillDequant() {
-        return mPreferInShaderPrefillDequant;
-    }
-    // M64 outer-dequant GEMM tile tier (see MetalConvolution1x1). True only on
-    // M4-class Macs, resolved from MTLDevice.architecture.name at runtime init.
-    bool preferM64Gemm() {
-        return mPreferM64Gemm;
+
+    // ---- Layer 3: route policy (cross-op) ----
+    // Enable the tensor API only where it maps to in-core neural accelerators;
+    // older chips keep the hand-written simdgroup kernels.
+    bool useTensorOps() const {
+        return mUseTensorOps;
     }
     void setGpuMode(const int cl_mode_num);
     void setCommandQueue(id<MTLCommandQueue> queue, bool userSync);
@@ -162,12 +193,19 @@ private:
     mutable std::map<std::vector<std::string>, id<MTLComputePipelineState>> mCachePipeine;
     mutable std::set<std::vector<std::string>> mFailedPipeline;
 private:
-    bool mSimdGroupReduce;
-    bool mSimdGroupMatrix;
-    bool mTensorOps;
-    bool mPreferInShaderPrefillDequant = false;
-    bool mPreferM64Gemm = false;
+    // Layer 1: software capability.
+    bool mSimdGroupReduce = false;
+    bool mSimdGroupMatrix = false;
+    bool mMetal4TensorApi = false;
+    // Layer 2: hardware identity.
+    MetalGpuInfo mGpuInfo;
+    // Layer 3: cross-op route policy.
+    bool mUseTensorOps = false;
     size_t mMaxThreadSize;
+    // Sticky session failure (e.g. iOS discarded the buffer under memory
+    // pressure). Never auto-reset: later device->host reads would return
+    // garbage otherwise. onSync gates on it.
+    mutable bool mCommandBufferFailed = false;
 };
 
 
@@ -223,6 +261,9 @@ public:
     static uint8_t* getMemPtr(const MemChunk& chunk);
     static void setBuffer(id<MTLBuffer> buffer, int offset, id<MTLComputeCommandEncoder> encoder, int index);
     static std::pair<id<MTLBuffer>, int> getBuffer(const MNN::Tensor* tensor);
+    // Point `tensor` at `owner`'s allocation at byteOffset, releasing what it
+    // held. Caller must keep `owner` alive and reapply after every resize.
+    static void aliasTensor(const Tensor* tensor, const Tensor* owner, size_t byteOffset);
     size_t getTensorSizeInBytes(const Tensor* tensor) const;
     virtual bool onSelectDynamicAllocator(int index, int maxIndex) override;
     id<MTLBuffer> getHostBuffer(size_t size) const;
@@ -243,6 +284,7 @@ public:
     }
     
     virtual Backend::MemObj* onAcquire(const Tensor *Tensor, StorageType storageType) override;
+    bool onCanShareBuffer(const Tensor* source, const Tensor* view) const override;
     virtual bool onClearBuffer() override;
     virtual void onCopyBuffer(const Tensor *srcTensor, const Tensor *dstTensor) const override;
 
@@ -280,6 +322,8 @@ public:
         return mRuntime->mStaticAllocator.get();
     }
     id<MTLCommandBuffer> getCommandBufferForBufferCopy() const;
+    // commit() joins these handlers before their source state can be reused.
+    void addCompletedHandler(MTLCommandBufferHandler handler) const;
 
     bool isCmdBufferCommit();
 #if MNN_METAL_OP_PROFILE
@@ -334,19 +378,16 @@ public:
     bool isSupportTensorApi() const {
         return mSupportTensorApi;
     }
-    // matmul2d input cooperative tensors (single-simdgroup scope + per-element
-    // operator[]). Required by fused attention, where the QK destination must
-    // become the PV left operand without going through memory. Probed
-    // separately from mSupportTensorApi because MNN's other tensor kernels only
-    // need a destination cooperative tensor at execution_simdgroups<4>.
+    // matmul2d input cooperative tensors (single-simdgroup scope), required by
+    // fused attention to pass QK -> PV in registers. Probed apart from the
+    // generic tensor-API flag.
     bool isSupportTensorCoopInput() const {
         return mSupportTensorCoopInput;
     }
 
-    // Export-time fused projection ops (FusedLinear) establish their
-    // own leader/follower wiring from the exported member order. They must do it
-    // after the allocator's compute(), because the setup re-homes follower
-    // outputs to STATIC, so they register here and onResizeEnd calls them back.
+    // Export-time fused projection ops (FusedLinear) register here and
+    // onResizeEnd calls them back after the allocator's compute(), since
+    // follower outputs are re-homed to STATIC.
     class FusedProjFusionHost {
     public:
         virtual ~FusedProjFusionHost() = default;
@@ -355,12 +396,8 @@ public:
     void registerFusedProj(FusedProjFusionHost* host) {
         mFusedProjs.push_back(host);
     }
-    // True when two tensors share backing memory. Any fusion that folds a
-    // producer into a consumer must check that the producer's inputs were not
-    // reused as the consumer's outputs: legal under the unfused schedule, but a
-    // read/write race once both live in one dispatch.
-    // Not static: the span of a tensor is getTensorSizeInBytes(), which needs the
-    // backend's fp16 mode, and an under-reported span misses real aliases.
+    // True when two tensors share backing memory. Not static because the span
+    // depends on the backend's fp16 mode; under-reporting misses aliases.
     bool tensorsOverlap(const Tensor* a, const Tensor* b) const;
 
     // LinearAttention gate/beta fold, declared by the exported
@@ -400,14 +437,19 @@ private:
     id<MTLCommandBuffer> getCommandBufferForNet() const;
     id<MTLComputeCommandEncoder> encoder_net() const;
     mutable id<MTLCommandBuffer> _commandBuffer = nil;
-    // Per-backend fence: the last command buffer THIS backend committed.
-    // onResizeBegin only needs to wait for our own in-flight work before
-    // resetting our allocator; draining the shared runtime's last commit
-    // (which may belong to another module's backend) serializes decode.
+    mutable bool mWaitForCompletedHandlers = false;
+    // Last command buffer committed by THIS backend; onResizeBegin waits on
+    // it before resetting the allocator.
     mutable id<MTLCommandBuffer> mLastOwnCommandBuffer = nil;
     mutable std::queue<id<MTLBuffer>> mHoldBuffers;
 
     id<MTLCommandQueue> _commandQueue;
+
+    // QoS override state for the encode/commit window (see onExecuteBegin).
+    // qos_class_t stored opaque so this header needs no platform include.
+    mutable bool mQosBoosted = false;
+    mutable unsigned int mQosPrevClass = 0;
+    mutable int mQosPrevRelPri = 0;
 
     const MetalRuntime* mRuntime;
     mutable NSUInteger mEncoderCount = 0;
@@ -441,10 +483,9 @@ private:
     std::shared_ptr<BufferAllocator> mExecutionBufferPool;
 #if MNN_METAL_OP_PROFILE
     mutable std::string mCurProfileName;
-    // MTLCounterSampleBuffer-based per-encoder GPU timing (accurate absolute
-    // numbers, no per-op command buffer commit). Falls back to legacy
-    // whole-command-buffer timing when stage-boundary sampling is unsupported
-    // or MNN_METAL_OP_PROFILE_LEGACY=1.
+    // MTLCounterSampleBuffer-based per-encoder GPU timing; falls back to
+    // whole-buffer timing when stage-boundary sampling is unsupported or
+    // MNN_METAL_OP_PROFILE_LEGACY=1.
     bool mProfileCounterMode = false;
     struct ProfilePendingSample {
         int index;         // startOfEncoderSampleIndex; end = index + 1
@@ -480,6 +521,7 @@ public:
         MetalBackend::addCreator(type, test);
     }
 };
+
 } // namespace MNN
 
 #define REGISTER_METAL_OP_CREATOR(name, opType)     \

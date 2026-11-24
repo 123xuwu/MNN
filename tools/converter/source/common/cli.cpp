@@ -177,17 +177,13 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
                                 "bits, default: 0, which means no weight quant",
                                 cxxopts::value<int>())(
         "weightQuantAsymmetric",
-        "the default weight-quant uses SYMMETRIC quant method, which is compatible with old MNN versions. "
-        "you can try set --weightQuantAsymmetric to use asymmetric quant method to improve accuracy of the "
-        "weight-quant model in some cases, "
-        "but asymmetric quant model cannot run on old MNN versions. You will need to upgrade MNN to new version to "
-        "solve this problem. default: false",
+        "use asymmetric weight quantization, default: true; set to 0/false for symmetric quantization",
         cxxopts::value<bool>())(
         "weightQuantBlock",
         "using block-wise weight quant, set block size, defaut: -1, which means channel-wise weight quant",
         cxxopts::value<int>())(
         "hqq",
-        "using hqq quant method to improve accuracy, default: false, if use hqq, weightQuantAsymmetric is set as true")(
+        "use HQQ weight quantization; requires weightQuantAsymmetric=true, default: false")(
         "weightQuantScaleBit",
         "bit-width for quant scale/zero-point storage. 32=fp32 (default), 16=fp16; 8/4 reserved for future",
         cxxopts::value<int>())("compressionParamsFile",
@@ -700,6 +696,10 @@ bool Cli::convertModel(modelConfig& modelPath) {
     if (needOptimize) {
         std::cout << "Start to Optimize the MNN Net..." << std::endl;
         finalNet = optimizeNet(netT, modelPath.forTraining, modelPath, expectedPass);
+        if (nullptr == finalNet) {
+            MNN_ERROR("[ERROR] Optimize failed.\n");
+            return false;
+        }
         if (finalNet->extraTensorDescribe.size()>0 && expectedPass.empty()) {
             MNN_PRINT("MNN net has tensor quant info\n");
             computeUnaryBuffer(finalNet.get());
@@ -731,6 +731,7 @@ bool Cli::convertModel(modelConfig& modelPath) {
         std::cout << "Converted Success!" << std::endl;
     } else {
         std::cout << "Converted Failed!" << std::endl;
+        return false;
     }
     if (modelPath.testDir.size() > 0) {
         std::cout << "Check convert result by " << modelPath.testDir << ", thredhold is " << modelPath.testThredhold << std::endl;

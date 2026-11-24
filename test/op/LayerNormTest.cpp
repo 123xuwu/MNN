@@ -5,11 +5,13 @@
 //  Created by MNN on 2023/07/05.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
+#include <algorithm>
 #include <cmath>
 #include <MNN/expr/Expr.hpp>
 #include <MNN/expr/ExprCreator.hpp>
 #include "MNNTestSuite.h"
 #include "TestUtils.h"
+#include "core/TensorUtils.hpp"
 
 using namespace MNN;
 using namespace MNN::Express;
@@ -320,8 +322,13 @@ public:
     }
 
     virtual bool run(int precision) {
-        return runOne(2, 8, false) && runOne(3, 5, false) && runOne(13, 1024, false) && runOne(2, 8, true) &&
-               runOne(3, 5, true) && runOne(13, 1024, true) && runOne(22, 128, true, true);
+        // batch == 1 takes the flat fast path instead of the packed kernel: at one token
+        // the packed offset degenerates to the channel index.
+        return runOne(1, 8, false) && runOne(1, 5, false) && runOne(1, 1024, false) && runOne(1, 12, true) &&
+               runOne(1, 1024, true) && runOne(1, 1020, true) && runOne(1, 128, true, true) &&
+               runOne(2, 8, false) && runOne(3, 5, false) && runOne(13, 1024, false) && runOne(5, 12, false) &&
+               runOne(2, 8, true) && runOne(3, 5, true) && runOne(13, 1024, true) && runOne(5, 12, true) &&
+               runOne(7, 1020, true) && runOne(22, 128, true, true);
     }
 };
 
@@ -371,10 +378,269 @@ public:
     }
 
     virtual bool run(int precision) {
-        return runOne(2, 8, false) && runOne(3, 5, false) && runOne(13, 1024, false) && runOne(2, 8, true) &&
-               runOne(3, 5, true) && runOne(13, 1024, true);
+        // batch == 1 is the decode shape: the fused 2-in/2-out op on a single token,
+        // which takes the flat fast path rather than the packed kernel. The last case
+        // has batch >= 256, which is where Metal switches to the row-parallel prefill
+        // kernel; the small batches never reach it.
+        return runOne(1, 8, false) && runOne(1, 5, false) && runOne(1, 1024, false) && runOne(1, 12, true) &&
+               runOne(1, 1024, true) && runOne(1, 1020, true) &&
+               runOne(2, 8, false) && runOne(3, 5, false) && runOne(13, 1024, false) && runOne(5, 12, false) &&
+               runOne(2, 8, true) && runOne(3, 5, true) && runOne(13, 1024, true) && runOne(5, 12, true) &&
+               runOne(7, 1020, true) && runOne(300, 512, true);
     }
 };
 
 MNNTestSuiteRegister(LayerNormC4Test, "op/layernorm/c4");
 MNNTestSuiteRegister(BinaryLayerNormC4Test, "op/layernorm/c4_binary");
+
+// The fused residual output must follow the same finite-range conversion as
+// the flat path. Normalization must still use the unrounded FP32 sum.
+class LayerNormFp16ResidualSaturationTest : public MNNTestCase {
+public:
+    bool run(int precision) override {
+        if (precision != BackendConfig::Precision_Low && precision != BackendConfig::Precision_Normal) {
+            return true;
+        }
+        int cases = 0, failures = 0;
+        bool checkedBackend = false;
+        for (int batch : {1, 2, 5, 13}) {
+            for (int channel : {8, 1, 3, 5, 9, 16, 17, 128}) {
+                for (bool rms : {false, true}) {
+                    for (bool affine : {false, true}) {
+                        for (int pattern = 0; pattern < 6; ++pattern) {
+                            std::vector<float> a(batch * channel), b(a.size()), exact(a.size()), stored(a.size());
+                            std::vector<float> gamma, beta;
+                            if (affine) {
+                                gamma.resize(channel);
+                                beta.resize(channel);
+                                for (int c = 0; c < channel; ++c) {
+                                    gamma[c] = 0.75f + (c % 3) * 0.125f;
+                                    beta[c] = (c % 3 - 1) * 0.125f;
+                                }
+                            }
+                            for (int n = 0; n < batch; ++n) {
+                                for (int c = 0; c < channel; ++c) {
+                                    const int i = n * channel + c;
+                                    if (pattern < 2) {
+                                        a[i] = b[i] = pattern == 0 ? 65504.0f : -65504.0f;
+                                    } else if (pattern == 2) {
+                                        a[i] = b[i] = (c % 2 == 0 ? 1.0f : -1.0f) * (c % 3 == 0 ? 65504.0f : 32752.0f);
+                                    } else if (pattern == 3) {
+                                        a[i] = c % 2 == 0 ? 65504.0f : -65504.0f;
+                                        b[i] = (c % 3 - 1) * 32.0f;
+                                    } else if (pattern == 4) {
+                                        a[i] = (c % 9 - 4) * 0.25f;
+                                        b[i] = (c % 5 - 2) * 0.125f;
+                                    } else {
+                                        // Clipping before statistics would change the relative magnitudes.
+                                        a[i] = c % 2 == 0 ? 65504.0f : 32752.0f;
+                                        b[i] = c % 2 == 0 ? 65504.0f : 0.0f;
+                                    }
+                                    exact[i] = a[i] + b[i];
+                                    stored[i] = precision == BackendConfig::Precision_Low
+                                                    ? std::min(std::max(exact[i], -65504.0f), 65504.0f)
+                                                    : exact[i];
+                                }
+                            }
+                            auto makeNorm = [&](const std::vector<VARP>& inputs, bool useRMS,
+                                                const std::vector<float>& g, const std::vector<float>& bias) {
+                                std::unique_ptr<OpT> op(new OpT);
+                                op->type = OpType_LayerNorm;
+                                op->main.type = OpParameter_LayerNorm;
+                                op->main.value = new LayerNormT;
+                                op->defaultDimentionFormat = MNN_DATA_FORMAT_NC4HW4;
+                                auto param = op->main.AsLayerNorm();
+                                param->axis = {1};
+                                param->epsilon = eps;
+                                param->useRMSNorm = useRMS;
+                                param->gamma = g;
+                                param->beta = bias;
+                                return Expr::create(std::move(op), inputs, inputs.size() == 2 ? 2 : 1);
+                            };
+                            auto expr =
+                                makeNorm({makeNC4HW4Input(a, batch, channel), makeNC4HW4Input(b, batch, channel)}, rms,
+                                         gamma, beta);
+                            auto sum = Variable::create(expr, 0);
+                            auto norm = Variable::create(expr, 1);
+                            Variable::prepareCompute({sum, norm});
+                            if (sum->readMap<float>() == nullptr) {
+                                return false;
+                            }
+                            if (!checkedBackend) {
+                                auto backend = TensorUtils::getDescribeOrigin(sum->getTensor())->getBackend();
+                                auto expectedBackend = precision == BackendConfig::Precision_Low
+                                                           ? MNN_FORWARD_CPU_EXTENSION
+                                                           : MNN_FORWARD_CPU;
+                                if (backend == nullptr || backend->type() != expectedBackend) {
+                                    MNN_PRINT("Residual saturation test: requested native CPU precision unavailable\n");
+                                    return true;
+                                }
+                                checkedBackend = true;
+                            }
+                            auto sumHost = _Convert(sum, NCHW);
+                            auto normHost = _Convert(norm, NCHW);
+                            // This consumer exposes Inf propagation into a subsequent normalization.
+                            auto next = Variable::create(makeNorm({sum}, true, {}, {}));
+                            auto nextHost = _Convert(next, NCHW);
+                            const auto* sumPtr = sumHost->readMap<float>();
+                            const auto* normPtr = normHost->readMap<float>();
+                            const auto* nextPtr = nextHost->readMap<float>();
+                            if (!sumPtr || !normPtr || !nextPtr) {
+                                return false;
+                            }
+                            std::vector<float> expectedNorm, expectedNext;
+                            computeChannelLayerNorm(exact, expectedNorm, batch, channel, gamma, beta, rms);
+                            computeChannelLayerNorm(stored, expectedNext, batch, channel, {}, {}, true);
+                            bool valid = true;
+                            for (int i = 0; i < batch * channel; ++i) {
+                                if (!std::isfinite(sumPtr[i]) || sumPtr[i] != stored[i] || !std::isfinite(normPtr[i]) ||
+                                    std::fabs(normPtr[i] - expectedNorm[i]) >
+                                        0.003f * (1.0f + std::fabs(expectedNorm[i])) ||
+                                    !std::isfinite(nextPtr[i]) ||
+                                    std::fabs(nextPtr[i] - expectedNext[i]) >
+                                        0.003f * (1.0f + std::fabs(expectedNext[i]))) {
+                                    if (failures < 4) {
+                                        MNN_ERROR(
+                                            "Residual saturation mismatch: batch=%d channel=%d rms=%d affine=%d "
+                                            "pattern=%d index=%d expectedSum=%g sum=%g norm=%g next=%g\n",
+                                            batch, channel, rms, affine, pattern, i, stored[i], sumPtr[i], normPtr[i],
+                                            nextPtr[i]);
+                                    }
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            failures += !valid;
+                            ++cases;
+                        }
+                    }
+                }
+            }
+        }
+        MNN_PRINT("Residual saturation: %d cases, %d failures\n", cases, failures);
+        return failures == 0;
+    }
+};
+MNNTestSuiteRegister(LayerNormFp16ResidualSaturationTest, "op/layernorm/fp16_residual_saturation");
+
+// A token must retain the flat-path result when other tokens are added to the
+// batch. Limit the exact comparison to the native ARM82 FP16 implementation;
+// other backends retain the tolerance-based tests above.
+class RMSNormFp16BatchConsistencyTest : public MNNTestCase {
+public:
+    bool run(int precision) override {
+#if !defined(__aarch64__)
+        // CPU_EXTENSION also identifies x86 backends; it alone does not prove native FP16 execution.
+        MNN_PRINT("RMSNorm FP16 batch consistency: requires native AArch64 ARM82\n");
+        return true;
+#endif
+        if (precision != BackendConfig::Precision_Low) {
+            return true;
+        }
+        bool checkedBackend = false;
+        bool backendUnavailable = false;
+        int cases = 0;
+        for (int channels : {16, 128, 896, 1008, 1024, 4096}) {
+            for (int batch : {2, 4, 5, 7, 8, 9, 13, 31, 32, 33, 65}) {
+                for (bool residual : {false, true}) {
+                    for (bool affine : {false, true}) {
+                        for (int pattern = 0; pattern < 6; ++pattern) {
+                            std::vector<float> gamma, beta;
+                            if (affine) {
+                                gamma.resize(channels);
+                                beta.resize(channels);
+                                for (int c = 0; c < channels; ++c) {
+                                    gamma[c] = pattern == 5 ? 100000.0f : 0.7f + 0.03f * (c % 7);
+                                    beta[c] = 0.02f * (c % 5 - 2);
+                                }
+                            }
+                            auto evaluate = [&](int rows, int firstRow, std::vector<float>& norm) {
+                                std::vector<float> a(rows * channels), b(rows * channels);
+                                for (int n = 0; n < rows; ++n) {
+                                    for (int c = 0; c < channels; ++c) {
+                                        const int row = pattern == 4 ? firstRow + n : 0;
+                                        a[n * channels + c] =
+                                            pattern == 1 ? 65504.0f
+                                                         : pattern == 2 ? 0.0f
+                                                                        : pattern == 3 ? (c % 3 - 1) * 0.00001f
+                                                                                       : ((c * 11 + row * 17) % 67 - 33) * 0.137f;
+                                        b[n * channels + c] =
+                                            pattern == 1 ? 65504.0f
+                                                         : pattern == 2 ? 0.0f
+                                                                        : pattern == 3 ? (c % 7 - 3) * 0.000003f
+                                                                                       : ((c * 5 + row * 13) % 43 - 21) * 0.081f;
+                                    }
+                                }
+                                std::vector<VARP> inputs{makeNC4HW4Input(a, rows, channels)};
+                                if (residual) {
+                                    inputs.emplace_back(makeNC4HW4Input(b, rows, channels));
+                                }
+                                std::unique_ptr<OpT> op(new OpT);
+                                op->type = OpType_LayerNorm;
+                                op->main.type = OpParameter_LayerNorm;
+                                op->main.value = new LayerNormT;
+                                op->defaultDimentionFormat = MNN_DATA_FORMAT_NC4HW4;
+                                auto param = op->main.AsLayerNorm();
+                                param->axis = {1};
+                                param->epsilon = 1e-5f;
+                                param->useRMSNorm = true;
+                                param->gamma = gamma;
+                                param->beta = beta;
+                                auto expr = Expr::create(std::move(op), inputs, residual ? 2 : 1);
+                                auto output = Variable::create(expr, residual ? 1 : 0);
+                                // Materialize the norm itself before inspecting its backend.
+                                const auto* ptr = output->readMap<float>();
+                                if (ptr == nullptr) {
+                                    return false;
+                                }
+                                if (!checkedBackend) {
+                                    auto backend = TensorUtils::getDescribeOrigin(output->getTensor())->getBackend();
+                                    if (backend == nullptr || backend->type() != MNN_FORWARD_CPU_EXTENSION) {
+                                        backendUnavailable = true;
+                                        MNN_PRINT("RMSNorm FP16 batch consistency: native ARM82 backend unavailable\n");
+                                        return false;
+                                    }
+                                    checkedBackend = true;
+                                }
+                                auto logical = _Convert(output, NCHW);
+                                ptr = logical->readMap<float>();
+                                if (ptr == nullptr) {
+                                    return false;
+                                }
+                                norm.assign(ptr, ptr + rows * channels);
+                                return true;
+                            };
+                            std::vector<float> flat, packed;
+                            if (!evaluate(1, 0, flat)) {
+                                return backendUnavailable;
+                            }
+                            if (!evaluate(batch, 0, packed)) {
+                                return false;
+                            }
+                            for (int n = 0; n < batch; ++n) {
+                                // Distinct rows detect swapped/reused token accumulators and tail offsets.
+                                if (pattern == 4 && n > 0 && !evaluate(1, n, flat)) {
+                                    return false;
+                                }
+                                for (int c = 0; c < channels; ++c) {
+                                    const int i = n * channels + c;
+                                    if (!std::isfinite(packed[i]) || packed[i] != flat[c]) {
+                                        MNN_ERROR(
+                                            "RMSNorm batch mismatch: batch=%d channels=%d residual=%d affine=%d "
+                                            "pattern=%d row=%d channel=%d flat=%.9g packed=%.9g\n",
+                                            batch, channels, residual, affine, pattern, n, c, flat[c], packed[i]);
+                                        return false;
+                                    }
+                                }
+                            }
+                            ++cases;
+                        }
+                    }
+                }
+            }
+        }
+        MNN_PRINT("RMSNorm native FP16 batch consistency: %d cases passed\n", cases);
+        return true;
+    }
+};
+MNNTestSuiteRegister(RMSNormFp16BatchConsistencyTest, "op/layernorm/fp16_rms_batch_consistency");

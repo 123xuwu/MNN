@@ -181,6 +181,10 @@ std::shared_ptr<Executor> Executor::newExecutor(MNNForwardType type,
     info.user = const_cast<BackendConfig*>(&config);
     std::shared_ptr<Runtime> runtime(creator->onCreate(info));
     auto executor = new Executor(runtime, type, numberThread);
+    // The runtime was created from `config`; the attr must agree, otherwise
+    // backends built later from this executor use the default precision.
+    executor->mAttr->config = config;
+    executor->mAttr->config.sharedContext = nullptr;
     return std::shared_ptr<Executor>(executor);
 }
 
@@ -418,6 +422,15 @@ void Executor::RuntimeManager::setCache(std::string cacheName) {
 
 void Executor::RuntimeManager::setExternalFile(std::string fileName) {
     mInside->mContent->mExternalFile = fileName;
+}
+
+bool Executor::RuntimeManager::setExternalFile(std::string fileName, int64_t offset, int64_t length) {
+    auto region = FileLoader::fileRegion(fileName, offset, length);
+    if (region.empty() || !FileLoader(region.c_str(), true).valid()) {
+        return false;
+    }
+    mInside->mContent->mExternalFile = std::move(region);
+    return true;
 }
 
 void Executor::RuntimeManager::updateCache() {

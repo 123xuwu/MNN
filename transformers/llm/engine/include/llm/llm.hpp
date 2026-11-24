@@ -8,6 +8,7 @@
 #ifndef LLM_hpp
 #define LLM_hpp
 
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@
 #include <MNN/expr/MathOp.hpp>
 #include <MNN/expr/NeuralNetWorkOp.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+
+#include "attention_mask.hpp"
 
 namespace MNN {
 struct KVMeta;
@@ -46,6 +49,34 @@ class Sampler;
 class Generation;
 class EagleGeneration;
 struct TimePerformance;
+
+// Supplies the model graph, tokenizer, configuration and external data for one LLM.
+class MNN_PUBLIC LlmResources {
+public:
+    // Non-owning view; retain immutable memory/files for the consuming Llm lifetime.
+    struct MNN_PUBLIC Resource {
+        const uint8_t* data = nullptr;
+        uint64_t size = 0;
+        std::string path;
+        uint64_t offset = 0;
+        bool bounded = false;
+
+        bool valid() const;
+        // Internal file readers preserve the bounds when reopening this locator.
+        std::string filePath() const;
+    };
+
+    struct Policy {
+        bool diskCache = true;
+        bool debugCallbacks = true;
+    };
+    virtual ~LlmResources() = default;
+    // Paths are relative to the package root, starting with optional "config.json".
+    // Return an empty Resource for a missing entry.
+    virtual Resource resource(const std::string& relativePath) const = 0;
+    virtual Policy policy() const { return Policy(); }
+};
+
 #define CHECK_LLM_RUNNING_RET(ctx, ret)                         \
 {                                                               \
     if ((ctx)->status == LlmStatus::NOT_LOADED ||               \
@@ -158,7 +189,9 @@ public:
     // Log buffer interface: retrieve accumulated log and clear the buffer.
     // Only effective when LLM_LOG_TO_STRING macro is enabled during compilation.
     std::string getLog();
+    // Returns nullptr if the model package or its required resources cannot be opened.
     static Llm* createLLM(const std::string& config_path);
+    static Llm* createLLM(std::shared_ptr<LlmResources> resources);
     static void destroy(Llm* llm);// For Windows RT mode should use destroy
     Llm(std::shared_ptr<LlmConfig> config);
     virtual ~Llm();
@@ -193,7 +226,7 @@ public:
     // full conversation (including assistant response). Optional — the cache
     // self-updates after generate(), but this allows callers with post-processed
     // response text (e.g. deleteThinkPart) to provide a more accurate version.
-    void syncPromptCache(const ChatMessages& chat_prompts);
+    virtual void syncPromptCache(const ChatMessages& chat_prompts);
     // config function
     std::string dump_config();
     bool set_config(const std::string& content);
@@ -202,10 +235,11 @@ public:
     // tokenier function
     bool is_stop(int token);
     std::string tokenizer_decode(int token);
-    virtual std::vector<int> tokenizer_encode(const std::string& query);
+    virtual std::vector<int> tokenizer_encode(const std::string& query, bool add_special_tokens = true);
     friend class Pipeline;
-    virtual std::vector<int> tokenizer_encode(const MultimodalPrompt& multimodal_input);
+    virtual std::vector<int> tokenizer_encode(const MultimodalPrompt& multimodal_input, bool add_special_tokens = true);
     // ptompt functions
+    bool has_chat_template() const;
     std::string apply_chat_template(const std::string& user_content) const;
     std::string apply_chat_template(const ChatMessages& chat_prompts) const;
     void response(const MultimodalPrompt& multimodal_input,
@@ -234,6 +268,7 @@ protected:
     std::shared_ptr<DiskEmbedding> mDiskEmbedding;
     std::shared_ptr<DiskEmbedding> mPleEmbedding;
     Express::VARP mPleInput; // PLE embeddings for current input
+    Express::VARP mDeepstackInput; // deepstack placeholder for visual models
     Express::VARP mTextEmbedsForPle; // Pure text embeddings for PLE projection
     std::shared_ptr<Sampler> mSampler;
     std::shared_ptr<Express::Executor::RuntimeManager> mRuntimeManager, mProcessorRuntimeManager;
@@ -245,13 +280,15 @@ protected:
      */
     const int mPrefillKey = 100;
     std::map<std::pair<int, bool>, std::shared_ptr<Express::Module>> mModulePool;
-    const Express::Module* mBaseModule = nullptr;
+    std::shared_ptr<Express::Module> mBaseModule;
     Express::VARP inputsEmbeds, attentionMask, positionIds;
-    std::vector<Express::VARP> mAttentionMaskVarVec, mPositionIdsVarVec;
+    std::vector<Express::VARP> mPositionIdsVarVec;
+    MaskCache mMaskCache;  // reusable masks for the decode shapes
     Express::VARP logitsAllIdx, logitsLastIdx;
     int mSeqLenIndex = 0;
     std::shared_ptr<MNN::Express::Executor> mExecutor;
 protected:
+    friend class LlmDelegate;
     friend class ArGeneration;
     friend class LookaheadGeneration;
     friend class MtpGeneration;
@@ -260,6 +297,12 @@ protected:
     friend class Omni;
     std::vector<Express::VARP> forwardVec(const std::vector<int>& input_ids);
     std::vector<Express::VARP> forwardVec(MNN::Express::VARP input_embeds);
+    // Validates the evaluated prefix and drops sampled tokens that have no KV entry.
+    virtual bool preparePromptCache(const std::string& prompt);
+    // Readies a text-only re-prefill of input_ids; false when they cannot be embedded from token ids alone.
+    virtual bool prepareHistoryReplay(const std::vector<int>& input_ids) {
+        return true;
+    }
 private:
     std::shared_ptr<Generation> mGenerationStrategy;
     void setSpeculativeConfig();
@@ -278,7 +321,11 @@ private:
     int mCallIndex;
     int mPrefixLength;
     bool mIsPrefixFileExist = false;
+    int mPrefixCacheNums = 0;
     void completePrefixWrite();
+    // -1 until the model graph is scanned on the first partial erase.
+    int mHasLinearAttention = -1;
+    bool replayKeptHistory(size_t begin, size_t end);
     // Prompt cache state
     std::string mCachedPromptText;
     void updateCachedPromptText(const ChatMessages& chat_prompts, size_t history_before);
@@ -288,6 +335,7 @@ private:
 class MNN_PUBLIC Embedding : public Llm {
 public:
     Embedding(std::shared_ptr<LlmConfig> config);
+    // Returns nullptr if the package is invalid or the requested load fails.
     static Embedding* createEmbedding(const std::string& config_path, bool load = true);
     static float dist(Express::VARP var0, Express::VARP var1);
     static float cos_sim(Express::VARP var0, Express::VARP var1);

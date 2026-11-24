@@ -3,6 +3,21 @@
 #include "AllShader.h"
 namespace MNN {
 void VulkanShaderMap::init() {
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+mMaps.insert(std::make_pair("glsl_indexed_linear_route_comp", std::make_pair(glsl_indexed_linear_route_comp,glsl_indexed_linear_route_comp_len)));
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+mMaps.insert(std::make_pair("glsl_indexed_linear_gemv_comp", std::make_pair(glsl_indexed_linear_gemv_comp,glsl_indexed_linear_gemv_comp_len)));
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+mMaps.insert(std::make_pair("glsl_indexed_linear_gemv_FP16_comp", std::make_pair(glsl_indexed_linear_gemv_FP16_comp,glsl_indexed_linear_gemv_FP16_comp_len)));
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+mMaps.insert(std::make_pair("glsl_indexed_linear_gemm_comp", std::make_pair(glsl_indexed_linear_gemm_comp,glsl_indexed_linear_gemm_comp_len)));
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+mMaps.insert(std::make_pair("glsl_indexed_linear_gemm_FP16_comp", std::make_pair(glsl_indexed_linear_gemm_FP16_comp,glsl_indexed_linear_gemm_FP16_comp_len)));
+#endif
 mMaps.insert(std::make_pair("glsl_int3_weight_to_pack_comp", std::make_pair(glsl_int3_weight_to_pack_comp,glsl_int3_weight_to_pack_comp_len)));
 mMaps.insert(std::make_pair("glsl_int3_weight_to_pack_FP16_comp", std::make_pair(glsl_int3_weight_to_pack_FP16_comp,glsl_int3_weight_to_pack_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_conv1x1_int2_weight_prepare_comp", std::make_pair(glsl_conv1x1_int2_weight_prepare_comp,glsl_conv1x1_int2_weight_prepare_comp_len)));
@@ -121,6 +136,8 @@ mMaps.insert(std::make_pair("glsl_convolution_FP16_comp", std::make_pair(glsl_co
 mMaps.insert(std::make_pair("glsl_convolution_RELU_FP16_comp", std::make_pair(glsl_convolution_RELU_FP16_comp,glsl_convolution_RELU_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_convolution_RELU6_FP16_comp", std::make_pair(glsl_convolution_RELU6_FP16_comp,glsl_convolution_RELU6_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_dynamic_w8a8_coop_gemm_comp", std::make_pair(glsl_dynamic_w8a8_coop_gemm_comp,glsl_dynamic_w8a8_coop_gemm_comp_len)));
+mMaps.insert(std::make_pair("glsl_dynamic_w8a8_coop_gemm_fused_comp", std::make_pair(glsl_dynamic_w8a8_coop_gemm_fused_comp,glsl_dynamic_w8a8_coop_gemm_fused_comp_len)));
+mMaps.insert(std::make_pair("glsl_dynamic_w8a8_coop_gemm_fused_FP16_comp", std::make_pair(glsl_dynamic_w8a8_coop_gemm_fused_FP16_comp,glsl_dynamic_w8a8_coop_gemm_fused_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_attention_prefill_kblock_qk_comp", std::make_pair(glsl_attention_prefill_kblock_qk_comp,glsl_attention_prefill_kblock_qk_comp_len)));
 mMaps.insert(std::make_pair("glsl_attention_prefill_kblock_qk_FP16_comp", std::make_pair(glsl_attention_prefill_kblock_qk_FP16_comp,glsl_attention_prefill_kblock_qk_FP16_comp_len)));
 mMaps.insert(std::make_pair("glsl_attention_prefill_kblock_qkv_acc_comp", std::make_pair(glsl_attention_prefill_kblock_qkv_acc_comp,glsl_attention_prefill_kblock_qkv_acc_comp_len)));

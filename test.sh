@@ -458,7 +458,9 @@ static_check() {
         log_err "cppcheck is required for static_check"
         _fail_static
     fi
-    if cppcheck --error-exitcode=1 --language=c++ --std=c++14 ${source_change} >/dev/null; then
+    # MNN_PUBLIC only carries symbol visibility. Left unresolved, cppcheck misparses
+    # `class MNN_PUBLIC X` and reports a bogus syntaxError inside the class body.
+    if cppcheck --error-exitcode=1 --language=c++ --std=c++14 -DMNN_PUBLIC= ${source_change} >/dev/null; then
         printf "TEST_NAME_STATIC_CHECK: cppcheck静态分析\nTEST_CASE_AMOUNT_STATIC_CHECK: {\"blocked\":0,\"failed\":0,\"passed\":1,\"skipped\":0}\n"
     else
         printf "TEST_NAME_STATIC_CHECK: cppcheck静态分析\nTEST_CASE_AMOUNT_STATIC_CHECK: {\"blocked\":0,\"failed\":1,\"passed\":0,\"skipped\":0}\n"
@@ -671,15 +673,22 @@ local_build() {
     # Local mode is CPU-only: host GPU drivers are usually unavailable or
     # unreliable on dev machines, so we omit OpenCL/Vulkan to keep the
     # build fast and the test surface meaningful.
-    cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DMNN_BUILD_TEST=ON \
-        -DMNN_LOW_MEMORY=ON \
-        -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
-        -DMNN_BUILD_LLM=ON \
-        -DMNN_BUILD_CONVERTER=ON \
-        ${platform_args[@]+"${platform_args[@]}"}
-    make -j"$(_host_jobs)"
+    if [[ -f CMakeCache.txt ]]; then
+        # Require the test target even if a previous reconfiguration disabled
+        # it. Preserve other options and reconfigure to refresh source globs.
+        cmake "${SCRIPT_DIR}" -DMNN_BUILD_TEST=ON
+    else
+        cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMNN_BUILD_TEST=ON \
+            -DMNN_LOW_MEMORY=ON \
+            -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
+            -DMNN_BUILD_LLM=ON \
+            -DMNN_LLM_BUILD_TEST=ON \
+            -DMNN_BUILD_CONVERTER=ON \
+            ${platform_args[@]+"${platform_args[@]}"}
+    fi
+    CMAKE_BUILD_PARALLEL_LEVEL="$(_host_jobs)" cmake --build .
     popd >/dev/null
     log_ok "host build complete"
 }
@@ -775,6 +784,18 @@ local_run_stages() {
         _run_json_model_stages smokeA local "${PUBLIC_MODELS_DIR}"
     fi
 
+    # Engine unit tests that need no model: omni prompt parsing, qwen video frame
+    # sampling / resize, and the per-frame temporal vision mask fill. Runs before the LLM
+    # block so a missing model or no network cannot skip it. The binary is assert-free --
+    # it counts failures and exits non-zero -- because CI builds Release, where -DNDEBUG
+    # would compile assert() out and the test would pass unconditionally.
+    if [[ -x "${SCRIPT_DIR}/build/test_omni_video_prompt" ]]; then
+        run_stage "llm-engine-unit" -- bash -c \
+            "cd '${SCRIPT_DIR}/build' && ./test_omni_video_prompt"
+    else
+        skip_stage "llm-engine-unit" "test_omni_video_prompt not built (check MNN_LLM_BUILD_TEST)"
+    fi
+
     # LLM smoke test. Model provisioning is lazy: it happens here, after the
     # unit + smoke stages have already run, so those proceed even with no
     # network. A failed provision skips just this stage.
@@ -785,6 +806,15 @@ local_run_stages() {
     else
         run_stage "llm/${LLM_MODEL_NAME}" -- bash -c \
             "cd '${SCRIPT_DIR}/build' && ./llm_demo '${LLM_MODEL_DIR}/config.json' '${LLM_MODEL_DIR}/prompt.txt'"
+        # Multi-instance concurrency regression (2 threads x 2 rounds): guards
+        # against races on process-global state shared across Llm instances
+        # (see transformers/llm/engine/test/test_multi_instance.cpp).
+        if [[ -x "${SCRIPT_DIR}/build/test_multi_instance" ]]; then
+            run_stage "llm-multi/${LLM_MODEL_NAME}" -- bash -c \
+                "cd '${SCRIPT_DIR}/build' && ./test_multi_instance '${LLM_MODEL_DIR}/config.json' 2 2"
+        else
+            skip_stage "llm-multi/${LLM_MODEL_NAME}" "test_multi_instance not built (check MNN_LLM_BUILD_TEST)"
+        fi
     fi
 }
 
@@ -815,6 +845,7 @@ android_build() {
         -DMNN_LOW_MEMORY=true \
         -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
         -DMNN_BUILD_LLM=ON \
+        -DMNN_LLM_BUILD_TEST=ON \
         -DMNN_BUILD_CONVERTER=ON \
         ${extra[@]+"${extra[@]}"}
     # build_64.sh hard-codes `make -j4`; respin with all cores so subsequent
@@ -830,6 +861,8 @@ android_build() {
 ANDROID_BIN_LIST=(
     libllm.so
     llm_demo
+    test_multi_instance
+    test_omni_video_prompt
     libMNN.so
     libMNN_CL.so
     libMNN_Vulkan.so
@@ -1085,19 +1118,17 @@ _run_json_model_stages() {
     local section_root="${2:-android}"
     local models_dir="${3:-${DEVICE_PUBLIC_MODELS_DIR}}"
     local -a rows=()
-    local row
+    local row stage_rows
     case "${kind}" in
         smokeA)
-            while IFS= read -r row; do rows+=("${row}"); done \
-                < <(_emit_json_smoke_stages "${section_root}" smoke_a_stages "${models_dir}") ;;
+            stage_rows="$(_emit_json_smoke_stages "${section_root}" smoke_a_stages "${models_dir}")" || return 1 ;;
         smokeB)
-            while IFS= read -r row; do rows+=("${row}"); done \
-                < <(_emit_json_smoke_stages "${section_root}" smoke_b_stages "${models_dir}") ;;
+            stage_rows="$(_emit_json_smoke_stages "${section_root}" smoke_b_stages "${models_dir}")" || return 1 ;;
         bench)
-            while IFS= read -r row; do rows+=("${row}"); done \
-                < <(_emit_json_bench_stages "${section_root}" "${models_dir}") ;;
+            stage_rows="$(_emit_json_bench_stages "${section_root}" "${models_dir}")" || return 1 ;;
         *) return 1 ;;
     esac
+    while IFS= read -r row; do rows+=("${row}"); done <<<"${stage_rows}"
     local name filt binary argv runner
     for row in "${rows[@]}"; do
         IFS='|' read -r name filt binary argv <<<"${row}"
@@ -1219,10 +1250,11 @@ _run_json_stages() {
     local section="${1:-android}"
     local runner="${2:-_remote_run_test}"
     local -a rows=()
-    local row
+    local row stage_rows
+    stage_rows="$(_emit_json_stages "${section}")" || return 1
     while IFS= read -r row; do
         rows+=("${row}")
-    done < <(_emit_json_stages "${section}")
+    done <<<"${stage_rows}"
     local name filt skip argv
     for row in "${rows[@]}"; do
         IFS='|' read -r name filt skip argv <<<"${row}"
@@ -1250,6 +1282,14 @@ android_llm_test() {
     if ad shell "[ -f ${remote}/config.json ]" 2>/dev/null; then
         run_stage "llm/${LLM_MODEL_NAME}" -- ad shell \
             "cd ${DEVICE_DIR} && export LD_LIBRARY_PATH=. && ./llm_demo ${remote}/config.json ${remote}/prompt.txt"
+        # Multi-instance concurrency regression, mirrors the local llm-multi
+        # stage (2 threads x 2 rounds).
+        if ad shell "[ -x ${DEVICE_DIR}/test_multi_instance ]" 2>/dev/null; then
+            run_stage "llm-multi/${LLM_MODEL_NAME}" -- ad shell \
+                "cd ${DEVICE_DIR} && export LD_LIBRARY_PATH=. && ./test_multi_instance ${remote}/config.json 2 2"
+        else
+            skip_stage "llm-multi/${LLM_MODEL_NAME}" "test_multi_instance not on device (check MNN_LLM_BUILD_TEST)"
+        fi
     else
         skip_stage "llm/${LLM_MODEL_NAME}" "model dir absent on device"
     fi
@@ -1260,11 +1300,7 @@ android_llm_test() {
 # ─────────────────────────────────────────────────────────────────────────────
 drive_local() {
     log_info "mode=local script_dir=${SCRIPT_DIR}"
-    if [[ ! -x "${SCRIPT_DIR}/build/run_test.out" ]]; then
-        local_build
-    else
-        log_info "reusing existing build/ (delete it to force a rebuild)"
-    fi
+    local_build
     # Try to populate the public smoke set after the build (MNNConvert is
     # produced by the build). Stages downstream gate on availability.
     provision_public_models || true
@@ -1306,6 +1342,14 @@ drive_android() {
     # unit / smoke / bench stages run even with no network, and so a missing
     # model skips only this stage instead of aborting the run.
     if _filter_runs llm; then
+        # Model-independent engine unit test (see local_run_stages): runs whether or not
+        # provisioning succeeds, so it still guards the omni helpers offline.
+        if ad shell "[ -x ${DEVICE_DIR}/test_omni_video_prompt ]" 2>/dev/null; then
+            run_stage "llm-engine-unit" -- ad shell \
+                "cd ${DEVICE_DIR} && export LD_LIBRARY_PATH=. && ./test_omni_video_prompt"
+        else
+            skip_stage "llm-engine-unit" "test_omni_video_prompt not on device (check MNN_LLM_BUILD_TEST)"
+        fi
         if provision_llm_model; then
             push_llm_model
             android_llm_test

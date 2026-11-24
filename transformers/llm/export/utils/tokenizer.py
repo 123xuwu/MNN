@@ -19,6 +19,7 @@ class LlmTokenizer(PreTrainedTokenizer):
         self.tokenizer = tokenizer
         self.tokenizer_path = tokenizer_path
         self.model_type = model_type
+        self.decode_buffer = []
         # stop_ids
         self.stop_ids = []
         self.stop_ids.append(self.tokenizer.eos_token_id)
@@ -95,26 +96,37 @@ class LlmTokenizer(PreTrainedTokenizer):
         return self.tokenizer.vocab_size
 
     def id_to_str(self, token_id):
+        token_id = int(token_id)
+        word = self._decode_token_ids(token_id)
+        if '\uFFFD' not in word:
+            return self.flush_decode_buffer() + word
+        # Smollm tokenizer can produce half of a Chinese character, so buffer
+        # token IDs until they form valid text. Bound retries so malformed bytes
+        # or a literal replacement character cannot swallow the rest of a reply.
+        self.decode_buffer.append(token_id)
+        buffer_txt = self._decode_token_ids(self.decode_buffer)
+        if not buffer_txt.endswith('\uFFFD'):
+            self.decode_buffer.clear()
+            return buffer_txt
+        if len(self.decode_buffer) >= 4:
+            # Keep the last three IDs for a possible four-byte UTF-8 character.
+            return self._decode_token_ids(self.decode_buffer.pop(0))
+        return ''
+
+    def _decode_token_ids(self, token_ids):
         try:
-            word = self.tokenizer.decode(int(token_id))
-        except:
-            def contains_replacement(text): return '\uFFFD' in text
-            def decode_id(token_id):
-                return self.tokenizer.convert_tokens_to_string(
-                        self.tokenizer._convert_id_to_token(int(token_id)))
-            def decode_ids(token_ids):
-                return self.tokenizer.convert_tokens_to_string(
-                        self.tokenizer.convert_ids_to_tokens(token_ids))
-            word = decode_id(int(token_id))
-            # Smollm tokenizer will produce half chinese character, using buffer to decode
-            if contains_replacement(word):
-                self.decode_buffer.append(token_id)
-                buffer_txt = decode_ids(self.decode_buffer)
-                if not contains_replacement(buffer_txt):
-                    word = buffer_txt
-                    self.decode_buffer.clear()
-                else:
-                    word = ''
+            return self.tokenizer.decode(token_ids)
+        except Exception:
+            tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+            if isinstance(tokens, str):
+                tokens = [tokens]
+            return self.tokenizer.convert_tokens_to_string(tokens)
+
+    def flush_decode_buffer(self):
+        if not self.decode_buffer:
+            return ''
+        word = self._decode_token_ids(self.decode_buffer)
+        self.decode_buffer.clear()
         return word
 
     @classmethod
@@ -196,6 +208,14 @@ class LlmTokenizer(PreTrainedTokenizer):
 
         with open(tokenizer_json_path, 'r', encoding='utf-8') as f:
             tj = json.load(f)
+        added_tokens = {token['id']: token for token in tj.get('added_tokens', [])}
+        for token_id, token in self.tokenizer.added_tokens_decoder.items():
+            added_tokens[token_id] = {
+                'id': token_id, 'content': token.content, 'special': token.special,
+                'lstrip': token.lstrip, 'rstrip': token.rstrip,
+                'single_word': token.single_word, 'normalized': token.normalized,
+            }
+        tj['added_tokens'] = list(added_tokens.values())
 
         file_path = os.path.join(save_directory, "tokenizer.mtok")
         MAGIC_NUMBER = 430
@@ -262,7 +282,12 @@ class LlmTokenizer(PreTrainedTokenizer):
             prefix_list = []
             if hasattr(self.tokenizer, 'get_prefix_tokens'):
                 prefix_list = self.tokenizer.get_prefix_tokens()
-            if len(prefix_list) == 0:
+            # A single-sequence post-processor already adds its tokens on every
+            # engine-side encode(); probing encode('A') here would store them as
+            # prefix tokens again and apply them twice (e.g. MiniCPM5's
+            # TemplateProcessing '<s> A' produced a doubled BOS).
+            post_ops = extract_single_post_processor_ops(tj.get('post_processor'))
+            if len(prefix_list) == 0 and len(post_ops) == 0:
                 try:
                     ids = self.tokenizer.encode('A')
                     get_txt = self.tokenizer.decode(ids[-1])
@@ -288,7 +313,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                     fp.write(struct.pack('<B', 6))
                     self._write_norm_table(fp, self._generate_nfkc_table())
                 elif ntype == 'NFC':
-                    fp.write(struct.pack('<B', 6))
+                    fp.write(struct.pack('<B', 9))
                     self._write_norm_table(fp, self._generate_nfc_table())
                 elif ntype == 'Prepend':
                     fp.write(struct.pack('<B', 2))

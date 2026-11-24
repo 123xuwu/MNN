@@ -10,6 +10,7 @@
 
 #include "generate.hpp"
 #include "core/MNNFileUtils.h"
+#include "llm/attention_mask.hpp"
 
 
 using namespace MNN::Express;
@@ -44,8 +45,8 @@ bool DFlashGeneration::load(Module::Config module_config) {
         Module::Config kc;
         kc.shapeMutable = true;
         kc.rearrange = true;
-        mKvMatModule.reset(Module::load({"new_context", "position_ids"}, {},
-            mLlm->mConfig->dflash_kvmat().c_str(), mLlm->mRuntimeManager, &kc));
+        mKvMatModule.reset(mLlm->mConfig->loadModule({"new_context", "position_ids"}, {}, mLlm->mConfig->dflash_kvmat(),
+                                                     mLlm->mRuntimeManager, &kc));
         if (mKvMatModule == nullptr) {
             MNN_ERROR("DFlash: failed to load %s. The draft attention consumes per-layer "
                       "kv_k_i/kv_v_i, so this module is mandatory; re-export the draft with "
@@ -89,10 +90,8 @@ bool DFlashGeneration::load(Module::Config module_config) {
     }
     dflashInputNames.insert(dflashInputNames.end(), {"attention_mask", "position_ids"});
     std::vector<std::string> dflashOutputNames{"hidden_states"};
-    mDFlashModule.reset(Module::load(
-        dflashInputNames, dflashOutputNames,
-        mLlm->mConfig->dflash_model().c_str(),
-        mLlm->mRuntimeManager, &module_config));
+    mDFlashModule.reset(mLlm->mConfig->loadModule(dflashInputNames, dflashOutputNames, mLlm->mConfig->dflash_model(),
+                                                  mLlm->mRuntimeManager, &module_config));
     if (mDFlashModule == nullptr) {
         MNN_ERROR("DFlash: failed to load draft %s with %d per-layer KV inputs (output '%s'). "
                   "%s and the draft must come from the same export.\n",
@@ -113,10 +112,8 @@ bool DFlashGeneration::load(Module::Config module_config) {
         lm_cfg.base = mLlm->mModule.get();
         std::vector<std::string> lmInputNames{sharedLmHeadInput};
         std::vector<std::string> lmOutputNames{"logits"};
-        mLmHeadModule.reset(Module::load(
-            lmInputNames, lmOutputNames,
-            mLlm->mConfig->llm_model().c_str(),
-            mLlm->mRuntimeManager, &lm_cfg));
+        mLmHeadModule.reset(mLlm->mConfig->loadModule(lmInputNames, lmOutputNames, mLlm->mConfig->llm_model(),
+                                                      mLlm->mRuntimeManager, &lm_cfg, mLlm->mConfig->llm_weight()));
         if (mLmHeadModule == nullptr) {
             MNN_ERROR("DFlash: failed to load shared lm_head subgraph {%s -> logits} from %s. "
                       "Set dflash_shared_lmhead_input to the target's post-final-norm tensor name.\n",
@@ -134,10 +131,8 @@ bool DFlashGeneration::load(Module::Config module_config) {
         fc_config.rearrange = true;
         std::vector<std::string> fcInputNames{"target_hidden"};
         std::vector<std::string> fcOutputNames{"context_hidden"};
-        mFcModule.reset(Module::load(
-            fcInputNames, fcOutputNames,
-            mLlm->mConfig->dflash_fc().c_str(),
-            mLlm->mRuntimeManager, &fc_config));
+        mFcModule.reset(mLlm->mConfig->loadModule(fcInputNames, fcOutputNames, mLlm->mConfig->dflash_fc(),
+                                                  mLlm->mRuntimeManager, &fc_config));
         if (mFcModule == nullptr) {
             MNN_ERROR("DFlash: failed to load %s (every draft step projects target hidden "
                       "states through it, so this module is mandatory)\n",
@@ -227,9 +222,14 @@ VARP DFlashGeneration::dflashForward(const std::vector<int>& block_ids) {
     int context_len = mDraftKv[0]->getInfo()->dim[1];
     int total_len = context_len + block_size;
 
-    // Non-causal attention mask: all zeros (everything attends to everything)
-    auto attention_mask = _Input({1, 1, block_size, total_len}, NCHW, halide_type_of<float>());
-    ::memset(attention_mask->writeMap<float>(), 0, block_size * total_len * sizeof(float));
+    // Everything attends to everything. Kept dense until omitting the plane is verified on a dflash model.
+    MaskRequest maskReq;
+    maskReq.type       = AttentionMaskType::Bidirectional;
+    maskReq.seqLen     = block_size;
+    maskReq.kvSeqLen   = total_len;
+    maskReq.rank       = 4;
+    maskReq.forceDense = true;
+    auto attention_mask = buildAttentionMask(maskReq, mLlm->mConfig->backend_type());
 
     // Draft-local RoPE positions: committed row r sits at r, so block slot i sits at context_len + i.
     auto position_ids = _Input({1, block_size}, NCHW, halide_type_of<int>());

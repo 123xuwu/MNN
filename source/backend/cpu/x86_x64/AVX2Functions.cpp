@@ -24,10 +24,10 @@ static void _MNNGetMatMulPackMode(int* eP, int* lP, int* hP) {
 }
 
 template <int Pack>
-static void _MNNNormPacked_Float(float* dest, float* sum, const float* source, const float* residual,
+static void _MNNNormPacked_Float(float* normOut, float* sumOut, const float* source, const float* residual,
                                  const float* gamma, const float* beta, float epsilon, size_t batch, size_t channels,
                                  bool RMSNorm, int tId, int threadNumber) {
-    MNN_ASSERT((residual == nullptr) == (sum == nullptr));
+    MNN_ASSERT((residual == nullptr) == (sumOut == nullptr));
     MNN_ASSERT(threadNumber > 0);
     const size_t channelUnit = UP_DIV(channels, Pack);
     for (size_t n = tId; n < batch; n += threadNumber) {
@@ -37,14 +37,14 @@ static void _MNNNormPacked_Float(float* dest, float* sum, const float* source, c
                 const size_t cu = c / Pack;
                 const size_t cr = c - cu * Pack;
                 const size_t index = (cu * batch + n) * Pack + cr;
-                sum[index] = source[index] + residual[index];
+                sumOut[index] = source[index] + residual[index];
             }
             for (size_t c = channels; c < channelUnit * Pack; ++c) {
                 const size_t cu = c / Pack;
                 const size_t cr = c - cu * Pack;
-                sum[(cu * batch + n) * Pack + cr] = 0.0f;
+                sumOut[(cu * batch + n) * Pack + cr] = 0.0f;
             }
-            normSource = sum;
+            normSource = sumOut;
         }
         float mean = 0.0f;
         if (!RMSNorm) {
@@ -76,12 +76,12 @@ static void _MNNNormPacked_Float(float* dest, float* sum, const float* source, c
             if (gamma && beta) {
                 norm = norm * gamma[c] + beta[c];
             }
-            dest[index] = norm;
+            normOut[index] = norm;
         }
         for (size_t c = channels; c < channelUnit * Pack; ++c) {
             const size_t cu = c / Pack;
             const size_t cr = c - cu * Pack;
-            dest[(cu * batch + n) * Pack + cr] = 0.0f;
+            normOut[(cu * batch + n) * Pack + cr] = 0.0f;
         }
     }
 }
@@ -126,6 +126,7 @@ bool AVX2Functions::init(int cpuFlags) {
 
     // For Packed Functions
     coreFunction->pack = 8;
+    coreFunction->MNNDeconv2x2Post = _AVX_MNNDeconv2x2Post;
     coreFunction->MNNNormPacked = _MNNNormPacked_Float<8>;
     _AVX_ExtraInit(coreFunction);
     _AVX_LinearAttentionInit(coreFunction);
@@ -144,6 +145,7 @@ bool AVX2Functions::init(int cpuFlags) {
         (cpuFlags & libyuv::kCpuHasAVX512VBITALG) || (cpuFlags & libyuv::kCpuHasAVX512VPOPCNTDQ) ||
         (cpuFlags & libyuv::kCpuHasAVX512VBMI2)) {
         coreFunction->pack = 16;
+        coreFunction->MNNDeconv2x2Post = nullptr;
         coreFunction->MNNNormPacked = _MNNNormPacked_Float<16>;
         _AVX512_ReorderInit(coreFunction);
         _AVX512_ExtraInit(coreFunction);

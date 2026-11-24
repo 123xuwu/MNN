@@ -62,8 +62,8 @@ struct RuntimeHint {
     int mmapFileSize = 1024; // MB
     int useCachedMmap = 0;
 
-    // op encoder number for once commit
-    int encorderNumForCommit = 10;
+    // -1 selects the backend default for op encoders per commit.
+    int encorderNumForCommit = -1;
     int initThreadNumber = 0;
 
     // whether to use Arm sme2 cores when threads>1
@@ -82,10 +82,9 @@ struct RuntimeHint {
     // per single SME core is six times that of NEON,
     //while during the Decode stage it is the same (1×).
     int divisionRatio = 41;
-
-    int smeCores = 2; // Number of SME cores of the backend, default is 2, if supports sme
 };
 /** abstract backend */
+struct Command;
 class Backend : public NonCopyable {
 
 public:
@@ -169,10 +168,18 @@ public:
     virtual void onResizeBegin() {
         // nothing to do
     }
+    // Re-allocation pass on a fixed plan must not drop commands the fixed group already
+    // recorded. Backends recording commands at resize time override this to keep them.
+    virtual void onReallocResizeBegin() { onResizeBegin(); }
     /**
      * @brief callback after resize ops.
      */
     virtual ErrorCode onResizeEnd() = 0;
+    // Graph backends may combine consecutive commands after their shapes are known.
+    virtual ErrorCode onResizeEnd(const std::vector<Command*>& commands) { return onResizeEnd(); }
+
+    // Whether the source allocation covers a full-range view with identical physical element order.
+    virtual bool onCanShareBuffer(const Tensor* source, const Tensor* view) const { return false; }
 
     /**
      * @brief callback before executing ops.

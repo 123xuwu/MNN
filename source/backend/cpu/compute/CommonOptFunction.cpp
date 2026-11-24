@@ -35,6 +35,8 @@ using Vec = MNN::Math::Vec<float, 4>;
 #endif
 
 #ifdef MNN_USE_RVV
+#include "backend/cpu/riscv/rvv/MNNRvvC4Functions.hpp"
+#include "../riscv/rvv/MNNRvvMatMulFunctions.hpp"
 extern void MNNAbsMaxFP32_RVV(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
 extern void MNNAccumulateSequenceNumber_RVV(float* dst, const float* src, int size);
 extern void MNNAsyQuantFunc_RVV(int8_t* dst, const float* src, float* qscale, float* qbias, const size_t* info);
@@ -61,9 +63,60 @@ extern void MNNPackForMatMul_B_RVV(float* destC, const float* sourceC, size_t h,
                                    bool transpose);
 extern void MNNQuantScaleFP32_RVV(float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch);
 extern void MNNGetMatMulPackMode_RVV(int* eP, int* lP, int* hP);
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern void MNNQuantAttentionKey_RVV(int8_t* dst, const float* source, float* sumKey, float* maxKey, int32_t* params);
+extern void MNNQuantAttentionValue_RVV(int8_t* dst, const float* source, float* valueSum, int32_t* params);
+#endif
+void MNNAttentionMaskQK_RVV(float* qkPacked, const float* scale, size_t seqLen, size_t processedKvSeq, int pack,
+                            int kvSeqLen, int kvoffset, int padKvSeqLen, const float* sinksPtr, const float* maskPtr,
+                            size_t maskElementSize, bool scaleApplied, bool isLowerTriangular);
+extern void MNNPackC4ForMatMul_A_RVV(float*, float const**, const int32_t*, const int32_t*);
+extern void MNNPackCUnit_RVV(float*, const float*, size_t, size_t, int*);
+extern void MNNUnpackCUnit_RVV(float*, const float*, size_t, size_t, int*);
+extern void MNNPackCUnitTranspose_RVV(float*, const float*, size_t, size_t, int*);
+extern void MNNUnpackCUnitTranspose_RVV(float*, const float*, size_t, size_t, int*);
+extern void MNNPackCUnitInt8_RVV(int8_t*, const int8_t*, size_t, size_t, int*);
+extern void MNNUnpackCUnitInt8_RVV(int8_t*, const int8_t*, size_t, size_t, int*);
+extern void MNNPackCUnitTransposeInt8_RVV(int8_t*, const int8_t*, size_t, size_t, int*);
+extern void MNNUnpackCUnitTransposeInt8_RVV(int8_t*, const int8_t*, size_t, size_t, int*);
+extern void MNNPackCUnitInt16_RVV(int16_t*, const int16_t*, size_t, size_t, int*);
+extern void MNNUnpackCUnitInt16_RVV(int16_t*, const int16_t*, size_t, size_t, int*);
+extern void MNNPackCUnitTransposeInt16_RVV(int16_t*, const int16_t*, size_t, size_t, int*);
+extern void MNNUnpackCUnitTransposeInt16_RVV(int16_t*, const int16_t*, size_t, size_t, int*);
+extern void MNNCountMaxMinValue_RVV(const float* source, float* minVal, float* maxVal, size_t size);
+extern void MNNReluInt8_RVV(int8_t* dst, const int8_t* src, size_t size, ssize_t zeroPoint);
+// The RVV kernels below are defined in the global namespace (they are plain C-style
+// symbols in source/backend/cpu/riscv/rvv/*.cpp), so their declarations must stay
+// outside namespace MNN as well. Declaring them inside the namespace mangles the
+// names as MNN::MNNMatrixAdd_RVV and breaks the link.
+extern void MNNMatrixAdd_RVV(float* C, const float* A, const float* B, size_t widthC4, size_t cStride,
+                             size_t aStride, size_t bStride, size_t height);
+extern void MNNMatrixSub_RVV(float* C, const float* A, const float* B, size_t widthC4, size_t cStride,
+                             size_t aStride, size_t bStride, size_t height);
+extern void MNNDeconvRunForUnitDepthWise_RVV(const float* dst, float* src, const float* weight, size_t fw, size_t fh,
+                                             size_t weight_y_step, size_t dilateX_step, size_t dilateY_step);
+extern void MNNConvRunForLineDepthwise_RVV(float* dst, const float* src, const float* weight, size_t width,
+                                           size_t src_w_setup, size_t fw, size_t fh, size_t dilateX_step,
+                                           size_t dilateY_step, size_t height, size_t srcHStep, size_t dstHStep,
+                                           const float* bias, const float* parameters);
+extern void MNNSamplerC4Bilinear_RVV(const unsigned char* source, unsigned char* dest, MNN::CV::Point* points,
+                                     size_t sta, size_t count, size_t capacity, size_t iw, size_t ih, size_t yStride);
+extern void MNNExpC8_RVV(float* dest, const float* source, float* offset, const float* parameters, size_t countC8);
+extern void MNNNorm_RVV(float* dst, const float* src, const float* gamma, const float* beta, float epsilon, size_t size,
+                        bool RMSNorm);
+extern void MNNGeluCommon_RVV(float* dst, const float* src, size_t size);
+extern void MNNGeluStandardCommon_RVV(float* dst, const float* src, size_t size);
+extern void MNNSiLu_RVV(float* dst, const float* src, size_t dataSize);
+extern void MNNSiLuLowp_RVV(float* dst, const float* src, size_t dataSize);
 namespace MNN {
 void MNNRvvInitializeFastPathFunctions(CoreFunctions* core);
 }
+extern void MNNRankOneUpdate_RVV(float* S, const float* k, const float* delta, size_t dk, size_t dv);
+extern void MNNDualMatVec_RVV(const float* S, const float* k, const float* q, float* out_k, float* out_q, size_t dk,
+                              size_t dv);
+extern void MNNDecayRankOneUpdate_RVV(float* S, const float* k, const float* delta, float decay, size_t dk, size_t dv);
+extern void MNNFusedGatedDelta_RVV(float* S, const float* k, const float* q, const float* v, float* out, float decay,
+                                   float beta, float kq, size_t dk, size_t dv);
 #endif
 
 #ifndef MNN_USE_SSE
@@ -537,7 +590,7 @@ static void MNNAsyQuantInfo_FP32(float* scale, float* bias, float* qscale, float
                 qscale[qind] = 255.f / (max_ - min_);
                 qbias[qind] = roundf(-min_ * 255.f / (max_ - min_)) - 128.0f;
                 scale[sind] = (max_ - min_) / 255.f;
-                bias[sind] = min_ + (128.f / 255.f) * (max_ - min_);
+                bias[sind] = -qbias[qind] * scale[sind];
             }
         }
     }
@@ -1323,6 +1376,50 @@ static void MNNFlashAttentionUpdateBlockOutput(float* dst, float* src, float* sc
     // dest shape:                   [headDim/pack, seqLen, pack]
     auto stride0 = plane * pack;
 
+    if (idx == kvBlocks - 1) {
+        // Last block: fuse the softmax normalization into this pass (single read/write of dst).
+        // Per-row reciprocals are hoisted via a chunked buffer to keep inner sweeps contiguous.
+        constexpr int kChunk = 256;
+        float nsBuf[kChunk];
+        if (idx > 0) {
+            for (int ic = 0; ic < seqStart; ic += kChunk) {
+                int iEnd = ALIMIN(ic + kChunk, seqStart);
+                for (int i = ic; i < iEnd; ++i) {
+                    nsBuf[i - ic] = 1.0f / normalizeScale[i];
+                }
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto offset = j * stride0 + i * pack;
+                        Vec::save(dst + offset, Vec::load(dst + offset) * Vec(nsBuf[i - ic]));
+                    }
+                }
+            }
+        }
+        int rowLo = (idx > 0) ? seqStart : 0;
+        for (int ic = rowLo; ic < plane; ic += kChunk) {
+            int iEnd = ALIMIN(ic + kChunk, plane);
+            for (int i = ic; i < iEnd; ++i) {
+                nsBuf[i - ic] = 1.0f / normalizeScale[i];
+            }
+            if (idx > 0) {
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto offset = j * stride0 + i * pack;
+                        auto dataNew = Vec::fma(Vec::load(src + offset), Vec::load(dst + offset), Vec(scale[i]));
+                        Vec::save(dst + offset, dataNew * Vec(nsBuf[i - ic]));
+                    }
+                }
+            } else {
+                for (int j = 0; j < depthQuad; ++j) {
+                    for (int i = ic; i < iEnd; ++i) {
+                        auto offset = j * stride0 + i * pack;
+                        Vec::save(dst + offset, Vec::load(src + offset) * Vec(nsBuf[i - ic]));
+                    }
+                }
+            }
+        }
+        return;
+    }
     if (idx > 0) {
         for (int j = 0; j < depthQuad; ++j) {
             int i = seqStart;
@@ -1336,16 +1433,6 @@ static void MNNFlashAttentionUpdateBlockOutput(float* dst, float* src, float* sc
         }
     } else {
         memcpy(dst, src, size * bytes);
-    }
-    if (idx == kvBlocks - 1) { // if last subBlock, exp(xi)/sum(exp(xi))
-        for (int j = 0; j < depthQuad; ++j) {
-            for (int i = 0; i < plane; ++i) {
-                auto dataNew = Vec::load(dst + j * stride0 + i * pack);
-                auto ns = Vec(1.0f / normalizeScale[i]);
-                dataNew = dataNew * ns;
-                Vec::save(dst + j * stride0 + i * pack, dataNew);
-            }
-        }
     }
 }
 
@@ -1438,20 +1525,35 @@ static void MNNPackedMatMulRemainWithSme2PackedB(float* C, const float* A, const
         }
         return;
     }
-    for (size_t e = 0; e < eSize; ++e) {
+    constexpr int ET = 4;
+    for (size_t e0 = 0; e0 < eSize; e0 += ET) {
+        const int eN = static_cast<int>(ALIMIN(eSize - e0, static_cast<size_t>(ET)));
         for (size_t y = 0; y < h; y += 4) {
             const size_t remain = ALIMIN((size_t)4, h - y);
             const float* weight = B + (y / 64) * bStride + y % 64;
-            auto sum = Vec(0.0f);
-            for (size_t z = 0; z < l; ++z) {
-                sum = Vec::fma(sum, Vec::load(weight + z * 64), Vec(A[z * aStride + e]));
+            Vec sum[ET];
+            for (int i = 0; i < ET; ++i) {
+                sum[i] = Vec(0.0f);
             }
-            float* dst = C + (y / 4) * cStride + e * 4;
-            if (remain == 4) {
-                Vec::save(dst, sum);
-            } else {
-                for (size_t i = 0; i < remain; ++i) {
-                    dst[i] = sum[i];
+            for (size_t z = 0; z < l; ++z) {
+                const auto w = Vec::load(weight + z * 64);
+                for (int i = 0; i < ET; ++i) {
+                    if (i < eN) {
+                        sum[i] = Vec::fma(sum[i], w, Vec(A[z * aStride + e0 + i]));
+                    }
+                }
+            }
+            for (int i = 0; i < ET; ++i) {
+                if (i >= eN) {
+                    break;
+                }
+                float* dst = C + (y / 4) * cStride + (e0 + i) * 4;
+                if (remain == 4) {
+                    Vec::save(dst, sum[i]);
+                } else {
+                    for (size_t j = 0; j < remain; ++j) {
+                        dst[j] = sum[i][j];
+                    }
                 }
             }
         }
@@ -1519,11 +1621,21 @@ void MNNQuantAttentionKey(int8_t* dst, const float* source, float* sumKeyPtr, fl
                 int i = d / lP;
                 int j = d % lP;
 
+#if defined(__riscv)
+                // Match RVV at quantization ties independently of -ffp-contract.
+                float normalized = (keySrc[d + k * blockL] - maxKeyPtr[d + k * blockL] - minKey) / (maxKey - minKey);
+                int int8v = (int)roundf(fmaf(normalized, 255.0f, -128.0f));
+#else
                 int int8v = (int)(roundf((keySrc[d + k * blockL] - maxKeyPtr[d + k * blockL] - minKey) /
                                              (maxKey - minKey) * 255.0f -
                                          128.0f));
+#endif
                 weightDst[i * weightStride2 + inIndex * lP + j] = int8v;
+#if defined(__riscv)
+                sumKey += fmaf((float)int8v, scaleDst[inIndex], biasDst[inIndex]);
+#else
                 sumKey += (int8v * scaleDst[inIndex] + biasDst[inIndex]);
+#endif
             }
         }
         sumKeyPtr[outIndex * hP + inIndex] = sumKey;
@@ -1581,7 +1693,11 @@ void MNNQuantAttentionValue(int8_t* dst, const float* source, float* valueSum, i
                 biasPtr[0] = dMax;
             } else {
                 float scale = range / 255.f;
+#if defined(__riscv)
+                float bias = fmaf(scale, 128.f, dMin);
+#else
                 float bias = range / 255.f * 128.f + dMin;
+#endif
                 scalePtr[0] = scale;
                 biasPtr[0] = bias;
             }
@@ -1621,12 +1737,20 @@ void MNNQuantAttentionValue(int8_t* dst, const float* source, float* valueSum, i
                            (kvSeqIndx % flashAttentionBlockKv) / lP * weightStride2 +
                            (kvSeqIndx % flashAttentionBlockKv) % lP;
             float xf = sourceFp32[s * srcStride0 + d + kvHeadIdx * headDim];
+#if defined(__riscv)
+            int8_t xq = ALIMAX(ALIMIN(127, static_cast<int32_t>(roundf(fmaf(xf, qscale, qbias)))), -128);
+#else
             int8_t xq = ALIMAX(ALIMIN(127, static_cast<int32_t>(roundf(xf * qscale + qbias))), -128);
+#endif
             dstBase[idxInner] = xq;
 
             // sum
             int idxSum = (kvSeqIndx / flashAttentionBlockKv) * ROUND_UP(headDim, hP);
+#if defined(__riscv)
+            sumBase[idxSum] += fmaf((float)xq, scaleBase[0], biasBase[0]);
+#else
             sumBase[idxSum] += ((float)xq * scaleBase[0] + biasBase[0]);
+#endif
         }
     }
 }
@@ -2823,8 +2947,13 @@ void MNNUnpackC4(float* dst, const float* src, size_t area, size_t depth, int* a
     MNNUnpackC4Common<float>(dst, src, area, depth, areaOffset);
 }
 
-#ifndef MNN_USE_RVV
 void MNNExpC8(float* dest, const float* source, float* offset, const float* parameters, size_t countC8) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNExpC8_RVV(dest, source, offset, parameters, countC8);
+        return;
+    }
+#endif
     auto count = countC8 * 8;
     auto param = parameters[0];
     float xLimit = 87;
@@ -2847,7 +2976,6 @@ void MNNExpC8(float* dest, const float* source, float* offset, const float* para
     }
     offset[3] = summer;
 }
-#endif
 
 void MNNSoftmax(float* softmaxDst, const float* softmaxSrc, float* runningMax, float* runningSum, float* updateScale,
                 int outside, int reduceSize, int kvSeqOffset, int validOffset, int pack, bool mask) {
@@ -3237,9 +3365,14 @@ void MNNGridSampleComputeCord3D(float* dst, const float* src, size_t inD, size_t
 }
 
 #ifndef MNN_USE_SSE
-#ifndef MNN_USE_RVV
 void MNNNorm(float* dst, const float* src, const float* gamma, const float* beta, float epsilon, size_t size,
              bool RMSNorm) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNNorm_RVV(dst, src, gamma, beta, epsilon, size, RMSNorm);
+        return;
+    }
+#endif
     float mean = 0;
     if (false == RMSNorm) {
         float sum = 0.f;
@@ -3424,8 +3557,78 @@ void MNNNorm(float* dst, const float* src, const float* gamma, const float* beta
     }
 #endif
 }
-#endif // MNN_USE_RVV
 #endif // MNN_USE_SSE
+
+static void MNNPoolingAvg(const void* channelInput, int inputWidth, int inputHeight, void* channelOutput,
+                          int outputWidth, int outputHeight, int kernelWidth, int kernelHeight, int strideWidth,
+                          int strideHeight, int padWidth, int padHeight, int padType, int countType) {
+    auto input = static_cast<const float*>(channelInput);
+    auto output = static_cast<float*>(channelOutput);
+    if (countType == MNN::AvgPoolCountType_DEFAULT) {
+        countType = padType == MNN::PoolPadType_CAFFE ? MNN::AvgPoolCountType_INCLUDE_PADDING
+                                                      : MNN::AvgPoolCountType_EXCLUDE_PADDING;
+    }
+    auto pool = [=](const float* src, float* dst, int width, int height, float scale) {
+        Vec4 sum(0.0f), sum1(0.0f);
+        for (int y = 0; y < height; ++y) {
+            const auto* cursor = src + y * inputWidth * 4;
+            int x = 0;
+            for (; x + 1 < width; x += 2, cursor += 8) {
+                sum = sum + Vec4::load(cursor);
+                sum1 = sum1 + Vec4::load(cursor + 4);
+            }
+            for (; x < width; ++x, cursor += 4) {
+                sum = sum + Vec4::load(cursor);
+            }
+        }
+        Vec4::save(dst, (sum + sum1) * Vec4(scale));
+    };
+    auto poolPad = [=](int oh, int ow) {
+        const int ih = oh * strideHeight - padHeight;
+        const int iw = ow * strideWidth - padWidth;
+        const int hStart = ALIMAX(ih, 0), hEnd = ALIMIN(ih + kernelHeight, inputHeight);
+        const int wStart = ALIMAX(iw, 0), wEnd = ALIMIN(iw + kernelWidth, inputWidth);
+        auto dst = output + (oh * outputWidth + ow) * 4;
+        if (hStart >= hEnd || wStart >= wEnd) {
+            pool(input, dst, 0, 0, 0.0f);
+            return;
+        }
+        int count = (hEnd - hStart) * (wEnd - wStart);
+        if (countType == MNN::AvgPoolCountType_INCLUDE_PADDING) {
+            count = (ALIMIN(ih + kernelHeight, inputHeight + padHeight) - ih) *
+                    (ALIMIN(iw + kernelWidth, inputWidth + padWidth) - iw);
+        }
+        pool(input + (hStart * inputWidth + wStart) * 4, dst, wEnd - wStart, hEnd - hStart,
+             count > 0 ? 1.0f / count : 0.0f);
+    };
+    int left = 0, right = outputWidth;
+    for (; left < outputWidth && left * strideWidth < padWidth; ++left) {
+    }
+    for (; right > left && (right - 1) * strideWidth - padWidth + kernelWidth > inputWidth; --right) {
+    }
+    const float scale = 1.0f / (kernelWidth * kernelHeight);
+    for (int oh = 0; oh < outputHeight; ++oh) {
+        const int ih = oh * strideHeight - padHeight;
+        int middleBegin = left, middleEnd = right;
+        if (ih < 0 || ih + kernelHeight > inputHeight) {
+            middleBegin = middleEnd = outputWidth;
+        }
+        int ow = 0;
+        for (; ow < middleBegin; ++ow) {
+            poolPad(oh, ow);
+        }
+        if (ow < middleEnd) {
+            const auto* src = input + (ih * inputWidth + ow * strideWidth - padWidth) * 4;
+            auto dst = output + (oh * outputWidth + ow) * 4;
+            for (; ow < middleEnd; ++ow, src += strideWidth * 4, dst += 4) {
+                pool(src, dst, kernelWidth, kernelHeight, scale);
+            }
+        }
+        for (; ow < outputWidth; ++ow) {
+            poolPad(oh, ow);
+        }
+    }
+}
 
 void MNNRoiPoolingMax(float* dst, const float* src, int hLen, int wLen, int iw) {
     Vec4 max = Vec4(-FLT_MAX);
@@ -3895,14 +4098,25 @@ void MNNHardSwishCommon(float* dst, const float* src, size_t size) {
 #endif
 }
 
-#ifndef MNN_USE_RVV
 void MNNGeluStandardCommon(float* dst, const float* src, size_t size) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNGeluStandardCommon_RVV(dst, src, size);
+        return;
+    }
+#endif
     for (int i = 0; i < size; i++) {
         dst[i] = (erf(src[i] * 0.7071067932881648) + 1) * src[i] * 0.5;
     }
 }
 
 void MNNGeluCommon(float* dst, const float* src, size_t size) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNGeluCommon_RVV(dst, src, size);
+        return;
+    }
+#endif
     int sizeQuad = static_cast<int32_t>(size / 8);
     int remain = static_cast<int32_t>(size) % 8;
 #if defined(MNN_USE_SSE) || defined(MNN_USE_NEON)
@@ -3937,7 +4151,6 @@ void MNNGeluCommon(float* dst, const float* src, size_t size) {
     }
 #endif
 }
-#endif
 
 void MNNScaleAndAddBiasScalar(float* dst, const float* src, float bias, float alpha, size_t number) {
     int numberC4 = (int)number / 4;
@@ -4012,7 +4225,11 @@ static void MNNRankOneUpdateDefault(float* S, const float* k, const float* delta
         float k_val = k[i];
         float* row = S + i * dv;
         for (size_t j = 0; j < dv; ++j) {
+#if defined(__riscv)
+            row[j] = fmaf(k_val, delta[j], row[j]);
+#else
             row[j] += k_val * delta[j];
+#endif
         }
     }
 }
@@ -4026,8 +4243,17 @@ static void MNNDualMatVecDefault(const float* S, const float* k, const float* q,
         float q_val = q[i];
         const float* row = S + i * dv;
         for (size_t j = 0; j < dv; ++j) {
+#if defined(__riscv)
+            out_k[j] = fmaf(row[j], k_val, out_k[j]);
+#else
             out_k[j] += row[j] * k_val;
+#endif
+
+#if defined(__riscv)
+            out_q[j] = fmaf(row[j], q_val, out_q[j]);
+#else
             out_q[j] += row[j] * q_val;
+#endif
         }
     }
 }
@@ -4038,7 +4264,11 @@ static void MNNDecayRankOneUpdateDefault(float* S, const float* k, const float* 
         float k_val = k[i];
         float* row = S + i * dv;
         for (size_t j = 0; j < dv; ++j) {
+#if defined(__riscv)
+            row[j] = fmaf(decay, row[j], k_val * delta[j]);
+#else
             row[j] = decay * row[j] + k_val * delta[j];
+#endif
         }
     }
 }
@@ -4212,18 +4442,43 @@ static void MNNFusedGatedDeltaDefault(float* S, const float* k, const float* q, 
         float ok = 0.0f, oq = 0.0f;
         for (size_t i = 0; i < dk; ++i) {
             float s = S[i * dv + j];
+
+#if defined(__riscv)
+            ok = fmaf(s, k[i], ok);
+#else
             ok += s * k[i];
+#endif
+
+#if defined(__riscv)
+            oq = fmaf(s, q[i], oq);
+#else
             oq += s * q[i];
+#endif
         }
+
+#if defined(__riscv)
+        float delta_j = beta * fmaf(-decay, ok, v[j]);
+#else
         float delta_j = beta * (v[j] - decay * ok);
+#endif
         deltaBuf[j] = delta_j;
+
+#if defined(__riscv)
+        out[j] = fmaf(decay, oq, kq * delta_j);
+#else
         out[j] = decay * oq + kq * delta_j;
+#endif
     }
     for (size_t i = 0; i < dk; ++i) {
         float k_val = k[i];
         float* row = S + i * dv;
         for (size_t j = 0; j < dv; ++j) {
+
+#if defined(__riscv)
+            row[j] = fmaf(decay, row[j], k_val * deltaBuf[j]);
+#else
             row[j] = decay * row[j] + k_val * deltaBuf[j];
+#endif
         }
     }
 #endif
@@ -4525,15 +4780,19 @@ void MNNSigmoid(float* dst, const float* src, size_t dataSize) {
     }
 }
 
-#ifndef MNN_USE_RVV
 void MNNSiLu(float* dst, const float* src, size_t dataSize) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNSiLu_RVV(dst, src, dataSize);
+        return;
+    }
+#endif
     float offset[4] = {-1.0f, 0.0f, 0.0f, 0.0f};
     MNNExp(dst, src, offset, dataSize);
     for (int i = 0; i < dataSize; ++i) {
         dst[i] = src[i] / (1.0f + dst[i]);
     }
 }
-#endif
 
 /**
  Modified from https://github.com/alibaba/MNN/pull/1359
@@ -4575,8 +4834,13 @@ void MNNSigmoidLowp(float* dst, const float* src, size_t dataSize) {
 #endif
 }
 
-#ifndef MNN_USE_RVV
 void MNNSiLuLowp(float* dst, const float* src, size_t dataSize) {
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNSiLuLowp_RVV(dst, src, dataSize);
+        return;
+    }
+#endif
     float offset[4] = {-1.0f, 0.0f, 0.0f, 0.0f};
     MNNExp(dst, src, offset, dataSize);
 #ifdef __aarch64__
@@ -4618,7 +4882,6 @@ void MNNSiLuLowp(float* dst, const float* src, size_t dataSize) {
     }
 #endif
 }
-#endif
 
 static void _MNNAdjustOptimalSparseKernel(int& sparseBlockOC,
                                           MNN::CoreFunctions::MNNPackedSparseMatMul& packedSparseMatMul) {
@@ -4773,10 +5036,10 @@ static void MNNRoPEComputeBasic(void* dst, const void* src, const void* cosEven,
 }
 
 template <int Pack>
-static void MNNNormPackedFloat(float* dest, float* sum, const float* source, const float* residual,
+static void MNNNormPackedFloat(float* normOut, float* sumOut, const float* source, const float* residual,
                                const float* gamma, const float* beta, float epsilon, size_t batch, size_t channels,
                                bool RMSNorm, int tId, int threadNumber) {
-    MNN_ASSERT((residual == nullptr) == (sum == nullptr));
+    MNN_ASSERT((residual == nullptr) == (sumOut == nullptr));
     MNN_ASSERT(threadNumber > 0);
     constexpr int tokenTile = 4;
     const size_t channelUnit = UP_DIV(channels, Pack);
@@ -4816,7 +5079,7 @@ static void MNNNormPackedFloat(float* dest, float* sum, const float* source, con
                     if (affine) {
                         value = vmlaq_f32(betaValue, value, gammaValue);
                     }
-                    vst1q_f32(dest + offset, value);
+                    vst1q_f32(normOut + offset, value);
                 }
             }
         }
@@ -4836,15 +5099,15 @@ static void MNNNormPackedFloat(float* dest, float* sum, const float* source, con
                         float value = source[offset + lane];
                         if (residual != nullptr) {
                             value += residual[offset + lane];
-                            sum[offset + lane] = value;
+                            sumOut[offset + lane] = value;
                         }
                         if (!RMSNorm) {
                             means[token] += value;
                         }
                     }
-                    if (sum != nullptr) {
+                    if (sumOut != nullptr) {
                         for (size_t lane = valid; lane < Pack; ++lane) {
-                            sum[offset + lane] = 0.0f;
+                            sumOut[offset + lane] = 0.0f;
                         }
                     }
                 }
@@ -4855,7 +5118,7 @@ static void MNNNormPackedFloat(float* dest, float* sum, const float* source, con
                 }
             }
         }
-        const float* normSource = sum != nullptr ? sum : source;
+        const float* normSource = sumOut != nullptr ? sumOut : source;
         float squareSums[tokenTile] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (size_t block = 0; block < channelUnit; ++block) {
             const size_t valid = ALIMIN(static_cast<size_t>(Pack), channels - block * Pack);
@@ -4882,10 +5145,10 @@ static void MNNNormPackedFloat(float* dest, float* sum, const float* source, con
                     if (gamma != nullptr && beta != nullptr) {
                         value = value * gamma[channel] + beta[channel];
                     }
-                    dest[offset + lane] = value;
+                    normOut[offset + lane] = value;
                 }
                 for (size_t lane = valid; lane < Pack; ++lane) {
-                    dest[offset + lane] = 0.0f;
+                    normOut[offset + lane] = 0.0f;
                 }
             }
         }
@@ -4987,7 +5250,8 @@ void MNNCoreFunctionInit() {
     gCoreFunction->MNNRoPECompute = MNNRoPEComputeBasic;
 
     gCoreFunction->MNNReluWithSlopeChannel = MNNReluWithSlopeChannel;
-    gCoreFunction->MNNPoolingAvg = (decltype(gCoreFunction->MNNPoolingAvg))(poolingAvg<float, Vec4, 4>);
+    gCoreFunction->MNNReluInt8 = MNNReluInt8;
+    gCoreFunction->MNNPoolingAvg = MNNPoolingAvg;
     // Set min value as 1 << 24
     gCoreFunction->MNNPoolingMax = (decltype(gCoreFunction->MNNPoolingMax))(poolingMax<float, Vec4, 4, -16777216>);
 
@@ -5026,6 +5290,7 @@ void MNNCoreFunctionInit() {
     gCoreFunction->supportRVV = gCPUInfo.rvv;
 
     gCoreFunction->smeCoreNumber = gCPUInfo.smeCoreNumber;
+    gCoreFunction->perfCoreNumber = gCPUInfo.perfCoreNumber;
 #ifdef MNN_PIPELINE_PROFILE
     if (const char* cpuTarget = std::getenv("MNN_CPU_TARGET")) {
         int target = ::atoi(cpuTarget);
@@ -5080,6 +5345,10 @@ void MNNCoreFunctionInit() {
 
 #if defined(__riscv) && defined(MNN_USE_RVV)
     if (gCoreFunction->supportRVV) {
+        gCoreFunction->MNNScaleAndAddBias = MNNScaleAndAddBias_RVV;
+        gCoreFunction->MNNReluWithSlopeChannel = MNNReluWithSlopeChannel_RVV;
+        gCoreFunction->MNNComputeMatMulForE_1 = MNNComputeMatMulForE_1_RVV;
+        gCoreFunction->MNNConvRunForLineDepthwise = MNNConvRunForLineDepthwise_RVV;
         gCoreFunction->MNNAccumulateSequenceNumber = MNNAccumulateSequenceNumber_RVV;
         gCoreFunction->MNNSumByAxisLForMatmul_A = MNNSumByAxisLForMatmul_A_RVV;
         gCoreFunction->MNNReorderWeightInt4 = MNNReorderWeightInt4_RVV;
@@ -5088,7 +5357,36 @@ void MNNCoreFunctionInit() {
         gCoreFunction->MNNPackedMatMulRemain = MNNPackedMatMulRemainFP32_RVV;
         gCoreFunction->MNNPackForMatMul_B = MNNPackForMatMul_B_RVV;
         gCoreFunction->MNNGetMatMulPackMode = MNNGetMatMulPackMode_RVV;
+        gCoreFunction->MNNAttentionMaskQK = MNNAttentionMaskQK_RVV;
+        gCoreFunction->MNNPackC4ForMatMul_A = MNNPackC4ForMatMul_A_RVV;
+        gCoreFunction->MNNPackCUnit = MNNPackCUnit_RVV;
+        gCoreFunction->MNNUnpackCUnit = MNNUnpackCUnit_RVV;
+        gCoreFunction->MNNPackCUnitTranspose = MNNPackCUnitTranspose_RVV;
+        gCoreFunction->MNNUnpackCUnitTranspose = MNNUnpackCUnitTranspose_RVV;
+        gCoreFunction->MNNPackCUnitInt8 = MNNPackCUnitInt8_RVV;
+        gCoreFunction->MNNUnpackCUnitInt8 = MNNUnpackCUnitInt8_RVV;
+        gCoreFunction->MNNPackCUnitTransposeInt8 = MNNPackCUnitTransposeInt8_RVV;
+        gCoreFunction->MNNUnpackCUnitTransposeInt8 = MNNUnpackCUnitTransposeInt8_RVV;
+        gCoreFunction->MNNPackCUnitInt16 = MNNPackCUnitInt16_RVV;
+        gCoreFunction->MNNUnpackCUnitInt16 = MNNUnpackCUnitInt16_RVV;
+        gCoreFunction->MNNPackCUnitTransposeInt16 = MNNPackCUnitTransposeInt16_RVV;
+        gCoreFunction->MNNUnpackCUnitTransposeInt16 = MNNUnpackCUnitTransposeInt16_RVV;
+        gCoreFunction->MNNCountMaxMinValue = MNNCountMaxMinValue_RVV;
+        gCoreFunction->MNNReluInt8 = MNNReluInt8_RVV;
+        gCoreFunction->MNNMatrixAdd = MNNMatrixAdd_RVV;
+        gCoreFunction->MNNMatrixSub = MNNMatrixSub_RVV;
+        gCoreFunction->MNNDeconvRunForUnitDepthWise = MNNDeconvRunForUnitDepthWise_RVV;
+        gCoreFunction->MNNSamplerC4Bilinear = MNNSamplerC4Bilinear_RVV;
+
         MNNRvvInitializeFastPathFunctions(gCoreFunction);
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+        gCoreFunction->MNNQuantAttentionKey = MNNQuantAttentionKey_RVV;
+        gCoreFunction->MNNQuantAttentionValue = MNNQuantAttentionValue_RVV;
+#endif
+        gCoreFunction->MNNRankOneUpdate = MNNRankOneUpdate_RVV;
+        gCoreFunction->MNNDualMatVec = MNNDualMatVec_RVV;
+        gCoreFunction->MNNDecayRankOneUpdate = MNNDecayRankOneUpdate_RVV;
+        gCoreFunction->MNNFusedGatedDelta = MNNFusedGatedDelta_RVV;
 #ifdef MNN_LOW_MEMORY
         gCoreFunction->MNNAbsMax = MNNAbsMaxFP32_RVV;
         gCoreFunction->MNNDynamicQuant = MNNDynamicQuantFP32_RVV;

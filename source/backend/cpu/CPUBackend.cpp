@@ -30,6 +30,9 @@
 #ifdef MNN_USE_ARMV82
 #include "backend/arm82/Arm82Backend.hpp"
 #endif
+#if defined(__riscv) && defined(MNN_USE_RVV)
+#include "riscv/rvv/RVVBackend.hpp"
+#endif
 #define MAX_THREAD_NUMBER 32
 #define LARGE_MEMORY 1024 * 1024 * 500
 #ifdef MNN_SUPPORT_BF16
@@ -51,12 +54,16 @@ ErrorCode CastWrapExecution::onExecute(const std::vector<Tensor*>& inputs, const
     CPUCastCreator::cast(inputs[0], outputs[0], cpuBackend, convertType);
     return NO_ERROR;
 }
-void CPUBackend::computeDivideSizes(int size, int* dst, float avgDiv) const {
-    if (mGroupWithComputeRate.size() <= 1 || (avgDiv > 0 && avgDiv < mComputeI)) {
+void CPUBackend::computeDivideSizes(int size, int* dst, float avgDiv, int threads) const {
+    if (threads <= 0 || threads > mThreadNumber) {
+        threads = mThreadNumber;
+    }
+    // Group rates are defined over the full thread set; a capped caller needs an even split.
+    if (mGroupWithComputeRate.size() <= 1 || (avgDiv > 0 && avgDiv < mComputeI) || threads != mThreadNumber) {
         // Avg divide
-        int length = UP_DIV(size, mThreadNumber);
+        int length = UP_DIV(size, threads);
         int cur = length;
-        for (int i=0; i<mThreadNumber; ++i) {
+        for (int i=0; i<threads; ++i) {
             dst[i] = cur;
             cur = cur + length;
             cur = ALIMIN(cur, size);
@@ -257,13 +264,6 @@ bool CPURuntime::onCheckInfo(Backend::Info& info) const {
     info.numThread = mThreadNumber;
     return true;
 }
-SingleBufferWithAllocator* CPURuntime::buffer(int index) const {
-    if (mDynamicMmap.empty()) {
-        return mDynamic.data() + index;
-    }
-    return mDynamicMmap.data() + index;
-}
-
 Backend* CPURuntime::onCreate(const BackendConfig* config, Backend* origin) const {
     {
         mCpuIds = hint().cpuIds;
@@ -355,6 +355,12 @@ Backend* CPURuntime::onCreate(const BackendConfig* config, Backend* origin) cons
             break;
         }
 #endif
+#if defined(__riscv) && defined(MNN_USE_RVV)
+        if (MNNGetCoreFunctions()->supportRVV) {
+            res = new RVVBackend(this, precision, memory, MNN_FORWARD_CPU, flags);
+            break;
+        }
+#endif
         res = new CPUBackend(this, precision, memory, MNN_FORWARD_CPU, flags);
     } while (false);
     mSharedDmaInfo = nullptr;
@@ -372,6 +378,11 @@ int CPURuntime::onGetRuntimeStatus(RuntimeStatus statusEnum) const {
             return MNNGetCoreFunctions()->supportSDot;
             break;
         }
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+        case STATUS_SUPPORT_FUSED_PROJ: {
+            return 1;
+        }
+#endif
         default: {
             MNN_ERROR("unsupported interface");
             break;
@@ -525,19 +536,44 @@ CPUBackend::CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode p
 CPUBackend::~CPUBackend() {
     // Do nothing
 }
-void CPUBackend::_resetDynamicMemory() const {
-    mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocator->apply();
-    if (NO_ERROR != mRuntime->pCurrentStatus) {
-        return;
+
+int CPUBackend::computeThreadNumber(int workItems) const {
+    int perfCores = mCoreFunctions->perfCoreNumber;
+    if (workItems > 1 && perfCores > 0 && mThreadNumber > perfCores) {
+        return perfCores;
     }
-    if (nullptr != mDmaInfo->mDynamicAllocatorBackup.get()) {
-        mRuntime->pCurrentStatus  = mDmaInfo->mDynamicAllocatorBackup->apply();
+    return mThreadNumber;
+}
+void CPUBackend::_prepareTensorMemory(const Tensor* srcTensor, const Tensor* dstTensor) const {
+    // Only prepare the plans backing these tensors. Applying this backend's
+    // unrelated plans can replace another graph's live shared arena.
+    DeferBufferAllocator* previous = nullptr;
+    for (auto tensor : {srcTensor, dstTensor}) {
+        auto node = TensorUtils::getDescribeOrigin(tensor)->cpuDynamicNode;
+        if (node == nullptr) {
+            continue;
+        }
+        if (node->allocator != previous) {
+            mRuntime->pCurrentStatus = node->allocator->apply();
+            if (mRuntime->pCurrentStatus != NO_ERROR) {
+                return;
+            }
+            previous = node->allocator;
+        }
+        // refTensorContent / clone may not be in the allocator's attached tensor list.
+        const_cast<Tensor*>(tensor)->buffer().host = static_cast<uint8_t*>(node->base) + node->offset;
     }
 }
 
 void CPUBackend::onExecuteBegin() const {
     mInitWorkQueue.reset();
-    _resetDynamicMemory();
+    mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocator->apply();
+    if (NO_ERROR != mRuntime->pCurrentStatus) {
+        return;
+    }
+    if (nullptr != mDmaInfo->mDynamicAllocatorBackup.get()) {
+        mRuntime->pCurrentStatus = mDmaInfo->mDynamicAllocatorBackup->apply();
+    }
 }
 
 void CPUBackend::onExecuteEnd() const {
@@ -582,6 +618,7 @@ Backend::MemObj* CPUBackend::allocBuffer(size_t size, Tensor* dest, StorageType 
             TensorUtils::getDescribeOrigin(dest)->mem = nullptr;
         }
     }
+    TensorUtils::getDescribeOrigin(dest)->cpuDynamicNode = nullptr;
     // MNN_PRINT("Acquire size = %d\n", size);
     if (size <= 0) {
         MNN_PRINT("Acquire buffer size = %lu\n", size);
@@ -624,6 +661,9 @@ Backend::MemObj* CPUBackend::allocBuffer(size_t size, Tensor* dest, StorageType 
 
     Backend::MemObj* res = nullptr;
 
+    // CPU tensor allocation uses a whole chunk; sub-chunk offsets are not introduced here.
+    MNN_ASSERT(chunk.node() == nullptr || chunk.second == 0);
+    TensorUtils::getDescribeOrigin(dest)->cpuDynamicNode = storageType == STATIC ? nullptr : chunk.node();
     if (storageType == STATIC) {
         res = new CPUMemObj(staticAllocator, chunk, size);
     } else {
@@ -643,6 +683,11 @@ void CPUBackend::enqueueTask(std::function<int()>&& task) {
     } else {
         task();
     }
+}
+
+bool CPUBackend::onCanShareBuffer(const Tensor* source, const Tensor* view) const {
+    return TensorUtils::isBufferLayoutCompatible(source, view, 0) &&
+        getTensorSize(source, true) == getTensorSize(view, true);
 }
 
 Backend::MemObj* CPUBackend::onAcquire(const MNN::Tensor* nativeTensorConst, StorageType storageType) {
@@ -697,7 +742,7 @@ void* CPUBackend::onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype
     if (OpCommonUtils:: convertDimType(TensorUtils::getDescribe(srcTensor)->dimensionFormat) != dtype) {
         return nullptr;
     }
-    _resetDynamicMemory();
+    _prepareTensorMemory(srcTensor, srcTensor);
     if (mRuntime->pCurrentStatus != NO_ERROR) {
         // Out of memory
         return nullptr;
@@ -819,7 +864,7 @@ std::pair<int, int> CPUBackend::multiThreadDivide(int size) const {
     return std::make_pair(sizeDivide, scheduleNumber);
 }
 void CPUBackend::onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const {
-    _resetDynamicMemory();
+    _prepareTensorMemory(srcTensor, dstTensor);
     if (mRuntime->pCurrentStatus != NO_ERROR) {
         // Out of memory
         return;

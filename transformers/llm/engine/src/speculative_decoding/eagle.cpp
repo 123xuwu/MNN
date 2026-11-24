@@ -32,18 +32,25 @@ bool EagleGeneration::load(Module::Config module_config) {
     std::vector<std::string> inputNames{"input_embed", "hidden_states", "attention_mask", "position_ids", "logits_index"};
     std::vector<std::string> outputNames {"logits", "out_hidden_states"};
     mEagleModules.resize(2);
-    mEagleModules[0].reset(Module::load(inputNames, outputNames, mLlm->mConfig->eagle_model().c_str(), mLlm->mRuntimeManager, &module_config));
+    mEagleModules[0].reset(mLlm->mConfig->loadModule(inputNames, outputNames, mLlm->mConfig->eagle_model(),
+                                                     mLlm->mRuntimeManager, &module_config));
     if (mEagleModules[0] == nullptr) {
         MNN_ERROR("Eagle: failed to load eagle model %s\n", mLlm->mConfig->eagle_model().c_str());
         return false;
     }
-    mEagleModules[1].reset(Module::load({"fc_hidden"}, {"hidden_states"}, mLlm->mConfig->eagle_fc().c_str(), mLlm->mRuntimeManager, &module_config));
+    mEagleModules[1].reset(mLlm->mConfig->loadModule({"fc_hidden"}, {"hidden_states"}, mLlm->mConfig->eagle_fc(),
+                                                     mLlm->mRuntimeManager, &module_config));
     if (mEagleModules[1] == nullptr) {
         MNN_ERROR("Eagle: failed to load eagle fc model %s\n", mLlm->mConfig->eagle_fc().c_str());
         return false;
     }
 
-    mD2t = Express::Variable::load(mLlm->mConfig->eagle_d2t().c_str())[0];
+    const auto variables = mLlm->mConfig->loadVariables(mLlm->mConfig->eagle_d2t());
+    if (variables.empty()) {
+        MNN_ERROR("Eagle: missing d2t resource\n");
+        return false;
+    }
+    mD2t = variables.begin()->second;
 
     // init
     mTopK = mLlm->mConfig->eagle_topk();
@@ -53,30 +60,15 @@ bool EagleGeneration::load(Module::Config module_config) {
 }
 
 MNN::Express::VARP EagleGeneration::getMask(std::vector<std::vector<bool>> mask, int seqLen) {
-    MNN::Express::VARP attentionMask;
-    int row = static_cast<int>(mask.size());
-    int col = static_cast<int>(mask[0].size());
-    if (row == col) {
-        attentionMask = _Input({1, 1, row, col}, NCHW, halide_type_of<float>());
-        auto maskPtr  = attentionMask->writeMap<float>();
-        for (int i = 0; i < row; i++) {
-            for (int j = 0; j < col; j++) {
-                maskPtr[i * col + j] = mask[i][j] ? 0.0 : std::numeric_limits<float>::lowest();
-            }
-        }
-    } else {
-        attentionMask = _Input({1, 1, row, seqLen + col}, NCHW, halide_type_of<float>());
-        auto maskPtr  = attentionMask->writeMap<float>();
-        for (int i = 0; i < row; i++) {
-            for (int j = 0; j < seqLen; j++) {
-                maskPtr[i * (seqLen + col) + j] = 0.0;
-            }
-            for (int j = 0; j < col; j++) {
-                maskPtr[i * (seqLen + col) + seqLen + j] = mask[i][j] ? 0.0 : std::numeric_limits<float>::lowest();
-            }
-        }
-    }
-    return attentionMask;
+    // A non-square matrix is preceded by `seqLen` committed keys visible to every query.
+    MaskRequest req;
+    req.type = AttentionMaskType::Tree;
+    req.tree = &mask;
+    req.rank = 4;
+    const int rows = mask.empty() ? 0 : (int)mask.size();
+    const int cols = rows == 0 ? 0 : (int)mask[0].size();
+    req.visiblePrefix = (rows == cols) ? 0 : seqLen;
+    return buildAttentionMask(req, mLlm->mConfig->backend_type());
 }
 
 void EagleGeneration::setPosition(int position) {
@@ -219,12 +211,9 @@ EagleGeneration::DraftInfo EagleGeneration::topkGenerate(const std::vector<int>&
     DraftInfo info;
     info.draftTokens = std::move(output.draftTokens);
     info.retrieveIndices = std::move(output.retrieveIndices);
-    info.attentionMask = _Input({1, 1, inputLen, inputLen}, NCHW, halide_type_of<float>());
-    for (int i = 0; i < inputLen; i++) {
-        for (int j = 0; j < inputLen; j++) {
-            info.attentionMask->writeMap<float>()[i * inputLen + j] = output.attentionMask[i][j] ? 0.0 : std::numeric_limits<float>::lowest();
-        }
-    }
+    // Square tree mask: the accepted draft is re-verified against itself, so there is no
+    // committed-history prefix. Same producer as the draft step's getMask call above.
+    info.attentionMask = getMask(output.attentionMask, 0);
     if (mLlm->mConfig->is_mrope()) {
         info.positionIds = _Input({3, inputLen}, NCHW, halide_type_of<int>());
         for (int i = 0; i < inputLen; i++) {

@@ -32,6 +32,7 @@ static ExecutionCacheKey makeExecutionCacheKey(const Op* op) {
 static bool supportPrearrangeClone(const Op* op) {
     return op->main_type() == OpParameter_Convolution2D || op->main_type() == OpParameter_LayerNorm ||
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+           op->main_type() == OpParameter_IndexedLinearParam ||
            op->main_type() == OpParameter_FusedLinearParam ||
 #endif
            op->type() == OpType_Attention || op->type() == OpType_Scale || op->type() == OpType_RoPE ||
@@ -84,9 +85,18 @@ static bool cloneBaseExecution(std::shared_ptr<Execution>& exe, const ExecutionC
     }
     Execution* copyExecution = nullptr;
     auto baseExe = iter->second.get();
-    baseExe->onClone(backend, op, &copyExecution);
+    auto srcBackend = baseExe->backend();
+    // Clone onto the backend whose type matches the source, same rule as Session::clone. Otherwise an
+    // execution the base put on the backup backend gets moved onto the primary one, which may lack the kernel.
+    Backend* prefer = backend;
+    Backend* fallback = backupBackend;
+    if (nullptr != srcBackend && srcBackend->type() != backend->type() && srcBackend->type() == backupBackend->type()) {
+        prefer = backupBackend;
+        fallback = backend;
+    }
+    baseExe->onClone(prefer, op, &copyExecution);
     if (copyExecution == nullptr) {
-        baseExe->onClone(backupBackend, op, &copyExecution);
+        baseExe->onClone(fallback, op, &copyExecution);
     }
     std::unique_ptr<Execution> cloned(copyExecution);
     if (cloned == nullptr || !cloned->onClone(nullptr, op, nullptr)) {
@@ -190,6 +200,11 @@ static std::vector<std::shared_ptr<BufferStorage>> preRearrangeWeights( // NOLIN
                                 exe.reset(cloned);
                             }
                         }
+                        if (exe == nullptr) {
+                            // Leave it to Pipeline, which reports the failed share instead of
+                            // creating a private kvcache.
+                            break;
+                        }
                     }
                 }
                 if (exe == nullptr) {
@@ -216,6 +231,9 @@ static std::vector<std::shared_ptr<BufferStorage>> preRearrangeWeights( // NOLIN
                 }
                 break;
             }
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+            case MNN::OpType_IndexedLinear:
+#endif
             case MNN::OpType_LayerNorm:
             case MNN::OpType_Scale:
             case MNN::OpType_RoPE: {
@@ -237,16 +255,49 @@ static std::vector<std::shared_ptr<BufferStorage>> preRearrangeWeights( // NOLIN
                     exe = nullptr;
                     break;
                 }
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+                if (op_table->main.type == OpParameter_IndexedLinearParam) {
+                    // All IndexedLinear clones share the already packed expert bank.
+                    auto param = op_table->main.AsIndexedLinearParam();
+                    for (auto& expert : param->linears) {
+                        if (!expert)
+                            continue;
+                        expert->weight.clear();
+                        expert->bias.clear();
+                        if (expert->quanParameter) {
+                            expert->quanParameter->buffer.clear();
+                            expert->quanParameter->alpha.clear();
+                            expert->quanParameter->alphaFp16.clear();
+                            expert->quanParameter->index.clear();
+                        }
+                        if (expert->symmetricQuan) {
+                            expert->symmetricQuan->weight.clear();
+                            expert->symmetricQuan->bias.clear();
+                        }
+                    }
+                }
+#endif
                 break;
             }
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
             case MNN::OpType_FusedLinear: {
                 cloneBaseExecution(exe, base_executions, op, backend, backupBackend);
                 if (exe == nullptr) {
-                    // Only Metal / OpenCL execute FusedLinear natively; other
-                    // backends decompose it in geometry, so pre-creation would
-                    // always fail.
-                    if (backend->type() != MNN_FORWARD_METAL && backend->type() != MNN_FORWARD_OPENCL) {
+                    // Pre-create on every backend that takes the op whole, so the member weights are
+                    // allocated once here and every session shares them through executionCache. A
+                    // backend that decomposes the op in geometry must not pre-create.
+                    // Mirror GeometryFusedProj::_keepWhole. METAL / OPENCL / HEXAGON keep the op whole
+                    // unconditionally and so decide by type here; VULKAN / CUDA answer through
+                    // STATUS_SUPPORT_FUSED_PROJ (their composite path may be compiled out). Getting this
+                    // wrong lets a backend fall through and allocate one copy of every fused projection
+                    // weight per session (2.2 GiB of Hexagon int4 weights became 3.7 GiB, which
+                    // exhausted the DSP-addressable memory and made the model unusable).
+                    auto runtime = backend->getRuntime();
+                    const bool keepsWhole =
+                        backend->type() == MNN_FORWARD_METAL || backend->type() == MNN_FORWARD_OPENCL ||
+                        backend->type() == MNN_FORWARD_HEXAGON ||
+                        (runtime != nullptr && runtime->onGetRuntimeStatus(STATUS_SUPPORT_FUSED_PROJ) != 0);
+                    if (!keepsWhole) {
                         break;
                     }
                     std::shared_ptr<BufferStorage> tmpstorage;
@@ -533,9 +584,9 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
             // Shape inference reads some inputs' CONTENT (e.g. the LLM logits-index
             // scalar feeding a StridedSlice begin), which historically forced a
             // full re-resize EVERY forward. Cache those inputs' bytes (tiny
-            // integer control tensors) and only force resize when one changed.
+            // control tensors) and only force resize when one changed.
             // MNN_LLM_CONTENT_RESIZE_ALWAYS=1 restores the legacy behavior.
-            static const bool sAlwaysResize = []{
+            static const bool sAlwaysResize = [] {
                 const char* e = getenv("MNN_LLM_CONTENT_RESIZE_ALWAYS");
                 return e != nullptr && e[0] == '1';
             }();
@@ -553,9 +604,16 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
                         continue;
                     }
                     auto inputTensor = Utils::getTensor(inputs[i]);
-                    if (inputTensor->getType().code == halide_type_float) {
-                        // integer tensors drive shape computation; float inputs
-                        // (embeddings / mask) do not feed shape inference
+                    if (inputTensor->getType().code == halide_type_float && !mResource->mInputNeedCPU[i]) {
+                        // Only float inputs consumed by shape inference need content comparison.
+                        continue;
+                    }
+                    // Backend storage may use a different precision or reside on a device.
+                    // Only cache plain host tensors; the input-copy path below handles conversion.
+                    if (nullptr != TensorUtils::getDescribeOrigin(inputTensor)->getBackend() ||
+                        0 != inputTensor->buffer().device) {
+                        mContentCache[i].clear();
+                        needResize = true;
                         continue;
                     }
                     auto size = inputTensor->usize();
@@ -579,6 +637,12 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
             }
             auto inputTensor = Utils::getTensor(inputs[i]);
             Schedule::TENSORCACHE* cacheTensor = nullptr;
+            // Loop submodules may receive updated contents at the same Tensor address.
+            // Refresh backend copies on each forward, even when the address is unchanged.
+            auto copyCache = pipelineInfo.first.inputTensorCopyCache.find(mInputTensors[i]);
+            if (copyCache != pipelineInfo.first.inputTensorCopyCache.end()) {
+                std::get<3>(copyCache->second) = true;
+            }
             if (mPrevInputTensor[i].first != inputTensor) {
                 auto newBackend = TensorUtils::getDescribeOrigin(inputTensor)->getBackend();
                 auto newType = MNN_FORWARD_CPU;
@@ -593,7 +657,10 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
                 MNN_ASSERT(cacheIter != pipelineInfo.first.inputTensorCopyCache.end());
                 std::get<3>(cacheIter->second) = true;
                 mPrevInputTensor[i] = std::make_pair(inputTensor, newType);
-                if (std::get<1>(*cacheTensor) != nullptr) {
+                if (std::get<0>(*cacheTensor) != nullptr && std::get<1>(*cacheTensor) == nullptr) {
+                    // Borrowed device tensors belong to the previous input and must not be refreshed.
+                    *cacheTensor = std::make_tuple(nullptr, nullptr, true, true);
+                } else if (std::get<1>(*cacheTensor) != nullptr) {
                     if (!WrapExecution::needWrap(
                             inputTensor, TensorUtils::getDescribeOrigin(std::get<0>(*cacheTensor))->getBackend())) {
                         // No need copy now, reset it
@@ -603,6 +670,16 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
             }
             auto srcDes = TensorUtils::getDescribe(inputTensor);
             auto des = TensorUtils::getDescribe(mInputTensors[i]);
+            if (des->dimensionFormat != srcDes->dimensionFormat) {
+                // Shape alone does not describe a copy tensor: its layout belongs to the previous input.
+                // Rebuild the cache before updating the format, even when the extents have not changed.
+                auto cacheIter = pipelineInfo.first.inputTensorCopyCache.find(mInputTensors[i]);
+                MNN_ASSERT(cacheIter != pipelineInfo.first.inputTensorCopyCache.end());
+                cacheTensor = &cacheIter->second;
+                *cacheTensor = std::make_tuple(nullptr, nullptr, true, true);
+                pipelineInfo.first.inputBackendChange = true;
+                needResize = true;
+            }
             bool needCopy = false;
             if (nullptr != srcDes->quantAttr.get()) {
                 if (nullptr == des->quantAttr.get()) {
@@ -626,6 +703,7 @@ ErrorCode StaticModule::_resize(const std::vector<Express::VARP>& inputs) {
                 mInputTensors[i]->buffer().host = srcPtr;
                 mInputTensors[i]->buffer().device = 0;
                 TensorUtils::getDescribeOrigin(mInputTensors[i])->setBackend(pipelineInfo.first.cache.second.get());
+                TensorUtils::getDescribeOrigin(mInputTensors[i])->cpuDynamicNode = nullptr;
                 if (nullptr == srcDes->quantAttr.get()) {
                     // For device need copy, cache device tensor
                     auto cacheIter = pipelineInfo.first.inputTensorCopyCache.find(mInputTensors[i]);

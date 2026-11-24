@@ -54,6 +54,7 @@ MNN supports end-to-end LLM export and inference:
 - **C++**: Google Style variant, see `.clang-format`. 4-space indent, 120-char line width, attached braces. Class names `PascalCase`, functions `camelCase`, member variables `mCamelCase`. RTTI and exceptions disabled (`-fno-rtti -fno-exceptions`). Default standard: C++11.
 - **Python**: Standard Python conventions
 - **Formatting**: `clang-format -i -style=file <file>`
+- **Comments**: 注释要精简，一处注释尽量两句话以内说清楚。只写代码本身看不出来的"为什么"，不要逐个成员/逐行解释，也不要写修改过程（如"替换了旧的 xxx"、"以前是 yyy"），这些放到 commit message 里。struct/类只在开头给一段整体说明，函数按类别分组即可。注释过多会让代码 AI 味太浓，反而降低可读性。
 
 > ⚠️ **禁止 C++ 全局对象（动态初始化）**:不允许在命名空间作用域定义需要动态初始化的非 POD 对象（如 `static const std::string` / `static const json` / 全局 STL 容器，**头文件中同样禁止**,每个包含它的 TU 都会生成一份）。这类对象产生 `__GLOBAL__sub_I_*` 启动初始化函数，会被手淘等打包静态检查拦截（代码安全风险 + 启动性能下降）。替代方案:`constexpr`/POD 常量（直接进 .rodata)、函数内 `static`（懒初始化）、或按需构造返回。
 
@@ -106,11 +107,10 @@ Public skills are listed below. Environment-dependent skills may exist under `sk
 |-------|-----------|---------|
 | Support new LLM | `skills/support-new-llm/SKILL.md` | Add / adapt a new LLM model |
 | Add new op | `skills/add-new-op/SKILL.md` | Add a new operator |
-| ARM CPU optimization | `skills/arm-cpu-optimize/SKILL.md` | Optimize op performance on ARM CPU |
-| RISC-V CPU optimization | `skills/riscv-cpu-optimize/SKILL.md` | Optimize standard RVV or vendor matrix-extension CPU paths |
+| CPU (ARM & x86_64 & RISC-V) | `skills/cpu/SKILL.md` | Any CPU-side work. Router with two branches: `optimize/` — diagnose **why** a CPU op / LLM path is slow and **which layer to change**; `kernel/` — **write / port** a kernel once profiling has located it (SIMD intrinsics or asm, pack & ABI contracts, dispatch registration, correctness gate). Architecture is a sub-layer inside each branch: `optimize/arch/{arm,x86_64,riscv}.md` is the **diagnosis** face (which path am I actually on — on ARM two orthogonal axes: architecture level aarch32 / aarch64 NEON baseline / v8.2 sdot / v8.6 smmla / v9.2 SME2, times precision fp32 / fp16 arm82 / bf16; on x86_64 a single ISA axis plain-C++/SSE/AVX2+FMA/AVX512 No-VNNI/AVX512 VNNI; on RISC-V a single ISA axis plain-C++/standard RVV/SpacemiT IME2 vendor matrix extension — and how to prove it), `kernel/arch/{arm,x86_64,riscv}.md` is the **implementation** face. `shared/` holds the cross-branch tools: build & benchmark discipline, env switch registry, RISC-V dev-board remote validation |
 | OpenCL optimization | `skills/opencl-optimize/SKILL.md` | Optimize op performance on OpenCL |
 | Vulkan optimization | `skills/vulkan-optimize/SKILL.md` | Optimize op performance on Vulkan |
 | Metal optimization | `skills/metal-optimize/SKILL.md` | Optimize op performance on Metal |
-| Bugfix / debugging | `skills/general-debug/SKILL.md` | Diagnose correctness bugs / regressions in MNN — organized by bug category. |
+| Bugfix / debugging | `skills/general-debug/SKILL.md` | Diagnose correctness bugs / regressions in MNN — router that dispatches by symptom to per-category sub-docs (memory aliasing, export/quant, host-side concurrency & refcount races, fp16 range, GPU OOB, kernel assumptions, stale cache, nondeterminism). |
 | Run tests / CI | `skills/test-ci/SKILL.md` | Run the regression / CI suite (host or on-device), benchmark LLM on a real iPhone/iPad, or add / select / retune a test stage |
 | Retrospective | `skills/retrospective/SKILL.md` | After non-trivial tasks with reusable lessons |
