@@ -93,8 +93,9 @@ jobs:
         if: steps.upstream_check.outputs.upstream_ahead == 'true' && steps.merge_changes.outputs.has_changes == 'true'
         run: |
           SYNC_BRANCH="sync-upstream"
+          # 先创建/重置本地同步分支，并推送当前合并提交，不使用 checkout 到旧 remote HEAD
           git checkout -B "$SYNC_BRANCH"
-          git push origin -f "$SYNC_BRANCH"
+          git push origin -f HEAD:refs/heads/"$SYNC_BRANCH"
           echo "sync_branch=${SYNC_BRANCH}" >> "$GITHUB_OUTPUT"
 
       - name: 创建同步PR
