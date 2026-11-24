@@ -65,10 +65,16 @@ public:
         void configTypical(std::shared_ptr<LlmConfig> llmConfig);
         void configPenalty(std::shared_ptr<LlmConfig> llmConfig);
         void configMixed(std::shared_ptr<LlmConfig> llmConfig);
+        // True iff stepPenalty would actually change any logit. Single source
+        // of truth for the "penalty enabled" decision shared by configMixed
+        // (auto-enable the step), buildPipeline (top-k prefilter is exact only
+        // when a leading penalty step is a no-op), and stepPenalty (early out).
+        bool isPenaltyActive() const;
     };
 public:
     static Sampler* createSampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
     Sampler(std::shared_ptr<LlmContext> context, std::shared_ptr<LlmConfig> config);
+    void setConfig(std::shared_ptr<LlmConfig> config);
     int sample(MNN::Express::VARP logits);
     int sample(MNN::Express::VARP logits, const std::vector<int>& indices);
 
@@ -76,9 +82,9 @@ private:
     std::shared_ptr<LlmContext> mContext;
     SamplerConfig mConfig;
     std::mt19937 mRng;
-    // GPU top-k prefilter: fetch only top-k values/indices instead of full
-    // vocab logits when topK is the first effective filter step.
-    bool mGpuTopKPrefilter = false;
+    // Fast top-k prefilter: fetch only top-k values/indices instead of the
+    // full vocab pipeline when topK is the first effective filter step.
+    bool mTopKPrefilter = false;
     // Pipeline
     using SamplerStep = std::function<void(SamplerState&)>;
     std::vector<SamplerStep> mPipeline;

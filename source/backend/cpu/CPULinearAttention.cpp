@@ -12,6 +12,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include "CPULinearAttention.hpp"
 #include "CPUBackend.hpp"
 #include "core/MNNFileUtils.h"
@@ -89,36 +90,6 @@ static inline void _writeAttentionOutput(int8_t* ptr, bool c4, int b, int l, int
     _writeElement(ptr, index, value, bytes);
 }
 
-// Snapshot the post-prefix recurrent state (lazy-allocated) for eraseHistory
-// rollback. Allocation failure leaves mSnapshotValid=false; rollback then
-// falls back to zeroing.
-static void snapshotPrefixState(StateCache* cache, Backend* backend) {
-    if (cache == nullptr || cache->mConvState.get() == nullptr) {
-        return;
-    }
-    int convStateBytes = cache->mConvState->elementSize();
-    if (cache->mConvStateSnapshot.get() == nullptr) {
-        cache->mConvStateSnapshot.reset(Tensor::createDevice<int8_t>({convStateBytes}));
-        if (!backend->onAcquireBuffer(cache->mConvStateSnapshot.get(), Backend::STATIC)) {
-            cache->mConvStateSnapshot.reset();
-            return;
-        }
-    }
-    ::memcpy(cache->mConvStateSnapshot->host<int8_t>(), cache->mConvState->host<int8_t>(), convStateBytes);
-    if (cache->mRecurrentState.get() != nullptr) {
-        int rnnBytes = cache->mRecurrentState->elementSize();
-        if (cache->mRecurrentStateSnapshot.get() == nullptr) {
-            cache->mRecurrentStateSnapshot.reset(Tensor::createDevice<int8_t>({rnnBytes}));
-            if (!backend->onAcquireBuffer(cache->mRecurrentStateSnapshot.get(), Backend::STATIC)) {
-                cache->mRecurrentStateSnapshot.reset();
-                return;
-            }
-        }
-        ::memcpy(cache->mRecurrentStateSnapshot->host<int8_t>(), cache->mRecurrentState->host<int8_t>(), rnnBytes);
-    }
-    cache->mSnapshotValid = true;
-}
-
 ErrorCode CPULinearAttention::onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto qkv = inputs[0];
     auto convWeight = inputs[3];
@@ -166,49 +137,6 @@ ErrorCode CPULinearAttention::onResize(const std::vector<Tensor*>& inputs, const
                 return OUT_OF_MEMORY;
             ::memset(mStateCache->mRecurrentState->host<int8_t>(), 0, batch * H * dk * dv * mBytes);
         }
-    } else if (seqLen > 1) {
-        // Prefill: decide keep/restore/reset from meta. LA state isn't
-        // token-indexed, so eraseHistory triggers a snapshot restore rather
-        // than a truncation.
-        bool loadingFromDisk =
-            (mMeta != nullptr && mMeta->file_flag == KVMeta::PendingRead && mMeta->file_name.size() > 0);
-        bool isExplicitRollback = (mMeta != nullptr && mMeta->remove > 0);
-        bool isFreshPrefill = (mMeta == nullptr || mMeta->previous == 0);
-        int convStateBytes = batch * convChannels * convStateSize * mBytes;
-        int rnnBytes = 0;
-        if (mStateCache->mRecurrentState.get() != nullptr) {
-            int H = mNumVHeads, dk = mHeadKDim, dv = mHeadVDim;
-            rnnBytes = batch * H * dk * dv * mBytes;
-        }
-        if (loadingFromDisk) {
-            // onExecute will mmap-load the prefix state and snapshot it.
-        } else if (isExplicitRollback) {
-            // eraseHistory(): roll back to the saved post-prefix snapshot. If no
-            // snapshot exists (rollback before any prefix prefill ran), zero out.
-            if (mStateCache->mSnapshotValid && mStateCache->mConvStateSnapshot.get() != nullptr) {
-                ::memcpy(mStateCache->mConvState->host<int8_t>(), mStateCache->mConvStateSnapshot->host<int8_t>(),
-                         convStateBytes);
-                if (mStateCache->mRecurrentState.get() != nullptr &&
-                    mStateCache->mRecurrentStateSnapshot.get() != nullptr) {
-                    ::memcpy(mStateCache->mRecurrentState->host<int8_t>(),
-                             mStateCache->mRecurrentStateSnapshot->host<int8_t>(), rnnBytes);
-                }
-            } else {
-                ::memset(mStateCache->mConvState->host<int8_t>(), 0, convStateBytes);
-                if (mStateCache->mRecurrentState.get() != nullptr) {
-                    ::memset(mStateCache->mRecurrentState->host<int8_t>(), 0, rnnBytes);
-                }
-            }
-        } else if (isFreshPrefill) {
-            // Fresh sequence: zero the state and drop any stale snapshot.
-            ::memset(mStateCache->mConvState->host<int8_t>(), 0, convStateBytes);
-            if (mStateCache->mRecurrentState.get() != nullptr) {
-                ::memset(mStateCache->mRecurrentState->host<int8_t>(), 0, rnnBytes);
-            }
-            mStateCache->mSnapshotValid = false;
-        }
-        // Else (mMeta->previous > 0 && mMeta->remove == 0): reuse_kv continuation.
-        // Keep the live state so the new prefill extends from it.
     }
 
     // ─── Temporary buffers (DYNAMIC) ───
@@ -226,13 +154,14 @@ ErrorCode CPULinearAttention::onResize(const std::vector<Tensor*>& inputs, const
     if (needRecurrentState) {
         int dk = mHeadKDim, dv = mHeadVDim;
         int threadNum = static_cast<CPUBackend*>(backend())->threadNumber();
-        // Per-thread scratch holds q_local + k_local + v_local + vPred + delta.
-        // Prefill uses MNNFusedGatedDelta (only needs first 2*dk+dv) but decode
-        // falls back to the legacy two-call path (MNNDualMatVec + scalar
-        // correction + MNNDecayRankOneUpdate) which needs the full 2*dk+3*dv:
-        // the fused kernel regressed FP32 decode by ~3.5% on small L=1 shapes.
-        int perThread = 2 * dk + 3 * dv;
-        mThreadLocalBuf.reset(Tensor::createDevice<int8_t>({threadNum * perThread * mBytes}));
+        // Per-thread scratch holds q_local + k_local + v_local + vPred + delta
+        // (native precision), plus 2*dk fp32 slots for the fp16 decode
+        // L2Norm+dot path (cvt to fp32, MNNNormalizeQKAndDot, cvt back).
+        // FP32 decode keeps the legacy two-call path (MNNDualMatVec + scalar
+        // correction + MNNDecayRankOneUpdate): the fused kernel regressed FP32
+        // decode by ~3.5% on small L=1 shapes.
+        int perThreadBytes = (2 * dk + 3 * dv) * mBytes + 2 * dk * (int)sizeof(float);
+        mThreadLocalBuf.reset(Tensor::createDevice<int8_t>({threadNum * perThreadBytes}));
         success = backend()->onAcquireBuffer(mThreadLocalBuf.get(), Backend::DYNAMIC);
         if (!success)
             return OUT_OF_MEMORY;
@@ -576,18 +505,25 @@ void CPULinearAttention::applyGateFold(const std::vector<Tensor*>& inputs) {
 }
 
 ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
-    // onResize() may be skipped when shapes are unchanged. Ensure state is reset here too.
     int batch = 0, convDim = 0, seqLen = 0;
     _linearAttentionDims(inputs[0], batch, convDim, seqLen);
-    if (seqLen > 1 && mMeta != nullptr && mMeta->previous == mMeta->remove) {
-        bool loadingFromDisk = (mMeta->file_flag == KVMeta::PendingRead && mMeta->file_name.size() > 0);
-        if (!loadingFromDisk) {
-            if (mStateCache->mConvState.get() != nullptr) {
-                ::memset(mStateCache->mConvState->host<int8_t>(), 0, mStateCache->mConvState->elementSize());
-            }
-            if (mStateCache->mRecurrentState.get() != nullptr) {
-                ::memset(mStateCache->mRecurrentState->host<int8_t>(), 0, mStateCache->mRecurrentState->elementSize());
-            }
+    const bool loadingFromDisk =
+        mMeta != nullptr && mMeta->file_flag == KVMeta::PendingRead && mMeta->file_name.size() > 0;
+    // The recurrent state folds every past token, so it can only continue, reset, or be restored from disk.
+    if (mMeta != nullptr && mMeta->remove > 0 && (mMeta->previous != mMeta->remove || mMeta->n_reserve > 0) &&
+        !loadingFromDisk) {
+        MNN_ERROR("CPULinearAttention: cannot erase part of the %zu-token history; reset all of it instead\n",
+                  mMeta->previous);
+        return NOT_SUPPORT;
+    }
+    // Checked here rather than in onResize, which is skipped when shapes are unchanged.
+    const bool resetHistory = mMeta == nullptr ? seqLen > 1 : mMeta->previous == mMeta->remove;
+    if (resetHistory && !loadingFromDisk) {
+        if (mStateCache->mConvState.get() != nullptr) {
+            ::memset(mStateCache->mConvState->host<int8_t>(), 0, mStateCache->mConvState->elementSize());
+        }
+        if (mStateCache->mRecurrentState.get() != nullptr) {
+            ::memset(mStateCache->mRecurrentState->host<int8_t>(), 0, mStateCache->mRecurrentState->elementSize());
         }
     }
 
@@ -636,23 +572,23 @@ ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, cons
             } else {
                 MNN_PRINT("CPULinearAttention: Failed to open prefix cache file: %s\n", pathk.c_str());
             }
-            // Load recurrent state (.v file)
-            auto vfd = MNNOpenFile(pathv.c_str(), MNN_FILE_READ);
-            if (vfd != INVALID_FILE) {
-                size_t vSize = MNNGetFileSize(vfd);
-                if (vSize > 0 && vSize != INVALID_SIZE && mStateCache->mRecurrentState.get() != nullptr) {
-                    void* vMap = MNNMmapFile(vfd, vSize, true);
-                    if (vMap != nullptr) {
-                        ::memcpy(mStateCache->mRecurrentState->host<int8_t>(), vMap, vSize);
-                        MNNUnmapFile(vMap, vSize);
+            // Load recurrent state (.v file); absent for stateless short_conv layers
+            if (mStateCache->mRecurrentState.get() != nullptr) {
+                auto vfd = MNNOpenFile(pathv.c_str(), MNN_FILE_READ);
+                if (vfd != INVALID_FILE) {
+                    size_t vSize = MNNGetFileSize(vfd);
+                    if (vSize > 0 && vSize != INVALID_SIZE) {
+                        void* vMap = MNNMmapFile(vfd, vSize, true);
+                        if (vMap != nullptr) {
+                            ::memcpy(mStateCache->mRecurrentState->host<int8_t>(), vMap, vSize);
+                            MNNUnmapFile(vMap, vSize);
+                        }
                     }
+                    MNNCloseFile(vfd);
+                } else {
+                    MNN_PRINT("CPULinearAttention: Failed to open prefix cache file: %s\n", pathv.c_str());
                 }
-                MNNCloseFile(vfd);
-            } else {
-                MNN_PRINT("CPULinearAttention: Failed to open prefix cache file: %s\n", pathv.c_str());
             }
-            // Snapshot the loaded state for in-memory eraseHistory rollback.
-            snapshotPrefixState(mStateCache.get(), backend());
         }
     }
 
@@ -699,25 +635,25 @@ ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, cons
             } else {
                 MNN_PRINT("CPULinearAttention: Failed to create prefix cache file: %s\n", pathk.c_str());
             }
-            // Save recurrent state (.v file) — may be empty for short_conv
+            // Save recurrent state (.v file). short_conv has no recurrent
+            // state: skip .v entirely so completePrefixWrite creates no
+            // _sync.v marker and the layer validates as stateless.
             size_t recurrentBytes =
                 (mStateCache->mRecurrentState.get() != nullptr) ? mStateCache->mRecurrentState->elementSize() : 0;
-            auto vfd = MNNCreateFile(pathv.c_str());
-            if (vfd != INVALID_FILE) {
-                if (recurrentBytes > 0) {
+            if (recurrentBytes > 0) {
+                auto vfd = MNNCreateFile(pathv.c_str());
+                if (vfd != INVALID_FILE) {
                     MNNSetFileSize(vfd, recurrentBytes);
                     void* vMap = MNNMmapFile(vfd, recurrentBytes);
                     if (vMap != nullptr) {
                         ::memcpy(vMap, mStateCache->mRecurrentState->host<int8_t>(), recurrentBytes);
                         MNNUnmapFile(vMap, recurrentBytes);
                     }
+                    MNNCloseFile(vfd);
+                } else {
+                    MNN_PRINT("CPULinearAttention: Failed to create prefix cache file: %s\n", pathv.c_str());
                 }
-                MNNCloseFile(vfd);
-            } else {
-                MNN_PRINT("CPULinearAttention: Failed to create prefix cache file: %s\n", pathv.c_str());
             }
-            // Snapshot the written state for in-memory eraseHistory rollback.
-            snapshotPrefixState(mStateCache.get(), backend());
         }
     }
 
@@ -932,12 +868,12 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
     const int totalHeads = B * H;
 
     int8_t* threadBufBase = mThreadLocalBuf->host<int8_t>();
-    // Prefill uses fused kernel (only first 2*dk+dv touched) but the per-thread
-    // stride must match the larger allocation (decode's 2*dk+3*dv).
-    const int perThread = 2 * d_k + 3 * d_v;
+    // Prefill uses fused kernel (only first 2*dk+dv touched); the per-thread
+    // stride must match the allocation (2*dk+3*dv native + 2*dk fp32 scratch).
+    const int perThreadBytes = (2 * d_k + 3 * d_v) * bytes + 2 * d_k * (int)sizeof(float);
 
     MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-        int8_t* tBuf = threadBufBase + (int)tId * perThread * bytes;
+        int8_t* tBuf = threadBufBase + (int)tId * perThreadBytes;
         // Local buffers in native format (fp16 or fp32)
         int8_t* q_local = tBuf;
         int8_t* k_local = tBuf + d_k * bytes;
@@ -1059,137 +995,200 @@ void CPULinearAttention::gated_delta_rule_decode(const std::vector<Tensor*>& inp
 
     const int threadNum = static_cast<CPUBackend*>(backend())->threadNumber();
 
-    // ─── Step 1: Conv1D + SiLU (L=1, one output per channel) ───
-    // Each channel: dot product of [convState, input_val] with weight, then SiLU
-    const int totalChannels = B * D;
-    MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-        for (int idx = (int)tId; idx < totalChannels; idx += threadNum) {
-            const int d = idx % D;
-
-            // Read the single input value for this channel
-            const float inputVal = _readQKV(qkvPtr, qkvC4, idx / D, d, 0, B, D, 1, bytes, pack);
-
-            // Compute conv: dot(cat(state, input), weight)
-            float sum = 0.0f;
-            const int8_t* stateChannel = convStatePtr + idx * convStateSize * bytes;
-            const int8_t* weight = convWPtr + d * K_conv * bytes;
-            for (int k = 0; k < convStateSize; ++k) {
-                sum += _readElement(stateChannel, k, bytes) * _readElement(weight, k, bytes);
-            }
-            sum += inputVal * _readElement(weight, convStateSize, bytes);
-
-            // SiLU activation
-            const float sigmoid_val = 1.0f / (1.0f + expf(-sum));
-            const float convResult = sum * sigmoid_val;
-            _writeElement(convOut, idx, convResult, bytes);
-
-            // Update conv state: shift left by 1, append new input
-            if (convStateSize > 0) {
-                for (int k = 0; k < convStateSize - 1; ++k) {
-                    const float v = _readElement(stateChannel, k + 1, bytes);
-                    _writeElement(convStatePtr + idx * convStateSize * bytes, k, v, bytes);
-                }
-                _writeElement(convStatePtr + idx * convStateSize * bytes, convStateSize - 1, inputVal, bytes);
-            }
-        }
-    }
-    MNN_CONCURRENCY_END();
-
-    // ─── Steps 2-5 fused: QKV extraction + L2Norm + Scale + Gated Delta Rule ───
+    // ─── Single fused region: per-group Conv1D+SiLU then gated delta rule ───
+    // Work item = one k_head group: its q/k conv channels plus the v channels and state update
+    // of its gqa_factor v-heads. Groups own disjoint channel sets, so each conv state channel
+    // is shifted exactly once. Items are grabbed dynamically: on heterogeneous P/E CPUs a
+    // static equal split strands the slower E-core workers and stalls the join (measured:
+    // t4->t8 scaling was flat at ~53us/layer). Numerics are assignment-independent here: all
+    // threads run identical kernels and each item writes disjoint outputs.
     const float qScale = 1.0f / sqrtf((float)d_k);
     const auto gcore = static_cast<CPUBackend*>(backend())->functions();
     auto* rnnStatePtr = mStateCache->mRecurrentState->host<int8_t>();
-
-    const int totalHeads = B * H;
     auto* threadBufBase = mThreadLocalBuf->host<int8_t>();
-    // Decode (L=1) keeps the legacy two-call path: the fused kernel regressed
-    // FP32 decode by ~3.5% on this shape (small d_v, single timestep).
-    const int perThread = 2 * d_k + 3 * d_v;
+    // fp16 decode uses the fused gated-delta kernel (16-col chunks, fp32 accum,
+    // single pass over S); fp32 decode keeps the legacy two-call path — the
+    // fused kernel regressed FP32 decode by ~3.5% on small L=1 shapes.
+    const int perThreadBytes = (2 * d_k + 3 * d_v) * bytes + 2 * d_k * (int)sizeof(float);
+    const bool useFusedFp16 = bytes == 2 && gcore->MNNFusedGatedDelta != nullptr;
+    const int totalGroups = B * H_k;
+    std::atomic<int> nextGroup(0);
+    // MNN_CONCURRENCY_BEGIN is a GCD block on Apple: captured variables are
+    // const copies, so reach the counter through a pointer to keep it mutable.
+    auto* pNextGroup = &nextGroup;
+
+    // Conv1D + SiLU for one channel (global index in B*D), shifting its conv state in place.
+    auto doConvChannel = [&](int ch) {
+        const int d = ch % D;
+        const float inputVal = _readQKV(qkvPtr, qkvC4, ch / D, d, 0, B, D, 1, bytes, pack);
+        float sum = 0.0f;
+        const int8_t* stateChannel = convStatePtr + (int64_t)ch * convStateSize * bytes;
+        const int8_t* weight = convWPtr + d * K_conv * bytes;
+        for (int k = 0; k < convStateSize; ++k) {
+            sum += _readElement(stateChannel, k, bytes) * _readElement(weight, k, bytes);
+        }
+        sum += inputVal * _readElement(weight, convStateSize, bytes);
+        const float sigmoid_val = 1.0f / (1.0f + expf(-sum));
+        _writeElement(convOut, ch, sum * sigmoid_val, bytes);
+        for (int k = 0; k + 1 < convStateSize; ++k) {
+            _writeElement(convStatePtr + (int64_t)ch * convStateSize * bytes, k,
+                          _readElement(stateChannel, k + 1, bytes), bytes);
+        }
+        if (convStateSize > 0) {
+            _writeElement(convStatePtr + (int64_t)ch * convStateSize * bytes, convStateSize - 1, inputVal, bytes);
+        }
+    };
+
+    // Conv1D + SiLU over the contiguous global channel range [ch0, ch0+n); the
+    // range never straddles a batch boundary. The NEON kernel applies when the
+    // new-token input x is contiguous per channel: for L=1 that holds for
+    // non-C4 (index b*D+d) and for C4 only when B==1 (token stride collapses).
+    const bool canFastConv = bytes == 2 && K_conv == 4 && gcore->MNNDecodeConv1DSiluK4Fp16 != nullptr &&
+                             (!qkvC4 || B == 1);
+    auto doConvRange = [&](int ch0, int n) {
+        if (n <= 0) {
+            return;
+        }
+        if (canFastConv) {
+            const int d0 = ch0 % D;
+            gcore->MNNDecodeConv1DSiluK4Fp16(
+                reinterpret_cast<float*>(convStatePtr + (int64_t)ch0 * convStateSize * bytes),
+                reinterpret_cast<const float*>(qkvPtr + (int64_t)(qkvC4 ? d0 : ch0) * bytes),
+                reinterpret_cast<const float*>(convWPtr + (int64_t)d0 * K_conv * bytes),
+                reinterpret_cast<float*>(convOut + (int64_t)ch0 * bytes), n);
+            return;
+        }
+        for (int i = 0; i < n; ++i) {
+            doConvChannel(ch0 + i);
+        }
+    };
 
     MNN_CONCURRENCY_BEGIN(tId, threadNum) {
-        int8_t* tBuf = threadBufBase + (int)tId * perThread * bytes;
+        int8_t* tBuf = threadBufBase + (int)tId * perThreadBytes;
         int8_t* q_local = tBuf;
         int8_t* k_local = tBuf + d_k * bytes;
         int8_t* v_local = tBuf + 2 * d_k * bytes;
         int8_t* localVPred = tBuf + (2 * d_k + d_v) * bytes;
         int8_t* localDelta = tBuf + (2 * d_k + 2 * d_v) * bytes;
+        float* qkFp32 = reinterpret_cast<float*>(tBuf + (2 * d_k + 3 * d_v) * bytes);
 
-        for (int idx = (int)tId; idx < totalHeads; idx += threadNum) {
-            const int b = idx / H;
-            const int h = idx % H;
-            const int k_head = h / gqa_factor;
+        for (;;) {
+            const int g = pNextGroup->fetch_add(1, std::memory_order_relaxed);
+            if (g >= totalGroups) {
+                break;
+            }
+            const int b = g / H_k;
+            const int kh = g % H_k;
+            const int hBegin = kh * gqa_factor;
+            const int hEnd = ALIMIN(hBegin + gqa_factor, H);
+            if (hBegin >= hEnd) {
+                continue;  // defensive: H_v < H_k leaves empty groups
+            }
 
-            int8_t* state = rnnStatePtr + idx * d_k * d_v * bytes;
+            const int chBase = b * D;
+            doConvRange(chBase + kh * d_k, d_k);
+            doConvRange(chBase + key_dim + kh * d_k, d_k);
+            for (int hh = hBegin; hh < hEnd; ++hh) {
+                doConvRange(chBase + 2 * key_dim + hh * d_v, d_v);
+            }
 
-            // L=1: conv_out is [B, D, 1], stride=1, contiguous read
             const int8_t* convBase = convOut + b * D * bytes;
-            const int8_t* qBase = convBase + k_head * d_k * bytes;
-            const int8_t* kBase = convBase + (key_dim + k_head * d_k) * bytes;
-            const int8_t* vBase = convBase + (2 * key_dim + h * d_v) * bytes;
+            for (int hh = hBegin; hh < hEnd; ++hh) {
+                const int idx = b * H + hh;
+                int8_t* state = rnnStatePtr + (int64_t)idx * d_k * d_v * bytes;
 
-            // ── Step 2: Extract q, k, v (contiguous copy, stride=1) ──
-            ::memcpy(q_local, qBase, d_k * bytes);
-            ::memcpy(k_local, kBase, d_k * bytes);
-            ::memcpy(v_local, vBase, d_v * bytes);
+                // L=1: conv_out is [B, D, 1], stride=1, contiguous read
+                const int8_t* qBase = convBase + kh * d_k * bytes;
+                const int8_t* kBase = convBase + (key_dim + kh * d_k) * bytes;
+                const int8_t* vBase = convBase + (2 * key_dim + hh * d_v) * bytes;
 
-            // ── Step 3+4: L2 Normalization + Scale, plus dot(k, q) ──
-            float kq = 0.0f;
-            if (bytes == 4) {
-                kq = gcore->MNNNormalizeQKAndDot(reinterpret_cast<float*>(q_local), reinterpret_cast<float*>(k_local),
-                                                 qScale, useL2Norm, d_k);
-            } else if (useL2Norm) {
-                const float eps = 1e-6f;
-                float qSumSq = 0.0f, kSumSq = 0.0f;
-                for (int i = 0; i < d_k; ++i) {
-                    const float qi = _readElement(q_local, i, bytes);
-                    const float ki = _readElement(k_local, i, bytes);
-                    qSumSq += qi * qi;
-                    kSumSq += ki * ki;
-                }
-                const float qNormScale = qScale / sqrtf(qSumSq + eps);
-                const float kInvNorm = 1.0f / sqrtf(kSumSq + eps);
-                for (int i = 0; i < d_k; ++i) {
-                    _writeElement(q_local, i, _readElement(q_local, i, bytes) * qNormScale, bytes);
-                    _writeElement(k_local, i, _readElement(k_local, i, bytes) * kInvNorm, bytes);
-                }
-            } else {
-                for (int i = 0; i < d_k; ++i) {
-                    _writeElement(q_local, i, _readElement(q_local, i, bytes) * qScale, bytes);
-                }
-            }
+                // ── Extract q, k, v (contiguous copy, stride=1) ──
+                ::memcpy(q_local, qBase, d_k * bytes);
+                ::memcpy(k_local, kBase, d_k * bytes);
+                ::memcpy(v_local, vBase, d_v * bytes);
 
-            // ── Step 5: Gated Delta Rule (legacy two-call path) ──
-            const float decay = expf(_readTokenChannel(gatePtr, gateC4, b, 0, h, B, 1, H, bytes, pack));
-            const float beta_t = _readTokenChannel(betaPtr, betaC4, b, 0, h, B, 1, H, bytes, pack);
-
-            // Pass 1 (read-only): out_k = S^T @ k → localVPred,
-            //                     out_q = S^T @ q → o_t (overwritten by correction below).
-            int8_t* o_t = outputC4 ? localDelta : outPtr + (b * H * d_v + h * d_v) * bytes;
-            gcore->MNNDualMatVec((float*)state, (float*)k_local, (float*)q_local, (float*)localVPred, (float*)o_t, d_k,
-                                 d_v);
-
-            // Analytic correction: delta = beta * (v - decay * vPred);
-            //                      out   = decay * out_q + dot(k,q) * delta.
-            if (bytes != 4) {
-                for (int i = 0; i < d_k; ++i) {
-                    kq += _readElement(k_local, i, bytes) * _readElement(q_local, i, bytes);
-                }
-            }
-            for (int i = 0; i < d_v; ++i) {
-                const float vPred_i = decay * _readElement(localVPred, i, bytes);
-                const float v_i = _readElement(v_local, i, bytes);
-                const float delta_i = beta_t * (v_i - vPred_i);
-                const float out_i = decay * _readElement(o_t, i, bytes) + kq * delta_i;
-                if (outputC4) {
-                    _writeAttentionOutput(outPtr, true, b, 0, h, i, B, 1, H, d_v, out_i, bytes, pack);
+                // ── L2 Normalization + Scale, plus dot(k, q) ──
+                float kq = 0.0f;
+                if (bytes == 4) {
+                    kq = gcore->MNNNormalizeQKAndDot(reinterpret_cast<float*>(q_local),
+                                                     reinterpret_cast<float*>(k_local), qScale, useL2Norm, d_k);
+                } else if (useFusedFp16) {
+                    float* qf = qkFp32;
+                    float* kf = qkFp32 + d_k;
+                    gcore->MNNLowpToFp32(reinterpret_cast<const int16_t*>(q_local), qf, d_k);
+                    gcore->MNNLowpToFp32(reinterpret_cast<const int16_t*>(k_local), kf, d_k);
+                    kq = gcore->MNNNormalizeQKAndDot(qf, kf, qScale, useL2Norm, d_k);
+                    gcore->MNNFp32ToLowp(qf, reinterpret_cast<int16_t*>(q_local), d_k);
+                    gcore->MNNFp32ToLowp(kf, reinterpret_cast<int16_t*>(k_local), d_k);
+                } else if (useL2Norm) {
+                    const float eps = 1e-6f;
+                    float qSumSq = 0.0f, kSumSq = 0.0f;
+                    for (int i = 0; i < d_k; ++i) {
+                        const float qi = _readElement(q_local, i, bytes);
+                        const float ki = _readElement(k_local, i, bytes);
+                        qSumSq += qi * qi;
+                        kSumSq += ki * ki;
+                    }
+                    const float qNormScale = qScale / sqrtf(qSumSq + eps);
+                    const float kInvNorm = 1.0f / sqrtf(kSumSq + eps);
+                    for (int i = 0; i < d_k; ++i) {
+                        _writeElement(q_local, i, _readElement(q_local, i, bytes) * qNormScale, bytes);
+                        _writeElement(k_local, i, _readElement(k_local, i, bytes) * kInvNorm, bytes);
+                    }
                 } else {
-                    _writeElement(o_t, i, out_i, bytes);
+                    for (int i = 0; i < d_k; ++i) {
+                        _writeElement(q_local, i, _readElement(q_local, i, bytes) * qScale, bytes);
+                    }
                 }
-                _writeElement(localDelta, i, delta_i, bytes);
-            }
 
-            // Pass 2: S = decay * S + k ⊗ delta.
-            gcore->MNNDecayRankOneUpdate((float*)state, (float*)k_local, (float*)localDelta, decay, d_k, d_v);
+                // ── Gated Delta Rule ──
+                const float decay = expf(_readTokenChannel(gatePtr, gateC4, b, 0, hh, B, 1, H, bytes, pack));
+                const float beta_t = _readTokenChannel(betaPtr, betaC4, b, 0, hh, B, 1, H, bytes, pack);
+
+                if (useFusedFp16) {
+                    // Fused: out_k/out_q + analytic correction + S update in one pass.
+                    int8_t* o_t = outputC4 ? localDelta : outPtr + (b * H * d_v + hh * d_v) * bytes;
+                    gcore->MNNFusedGatedDelta((float*)state, (float*)k_local, (float*)q_local, (float*)v_local,
+                                              (float*)o_t, decay, beta_t, kq, d_k, d_v);
+                    if (outputC4) {
+                        for (int i = 0; i < d_v; ++i) {
+                            _writeAttentionOutput(outPtr, true, b, 0, hh, i, B, 1, H, d_v,
+                                                  _readElement(localDelta, i, bytes), bytes, pack);
+                        }
+                    }
+                    continue;
+                }
+
+                // Legacy two-call path (fp32 decode, or defensive fallback).
+                // Pass 1 (read-only): out_k = S^T @ k → localVPred,
+                //                     out_q = S^T @ q → o_t (overwritten by correction below).
+                int8_t* o_t = outputC4 ? localDelta : outPtr + (b * H * d_v + hh * d_v) * bytes;
+                gcore->MNNDualMatVec((float*)state, (float*)k_local, (float*)q_local, (float*)localVPred, (float*)o_t,
+                                     d_k, d_v);
+
+                // Analytic correction: delta = beta * (v - decay * vPred);
+                //                      out   = decay * out_q + dot(k,q) * delta.
+                if (bytes != 4) {
+                    for (int i = 0; i < d_k; ++i) {
+                        kq += _readElement(k_local, i, bytes) * _readElement(q_local, i, bytes);
+                    }
+                }
+                for (int i = 0; i < d_v; ++i) {
+                    const float vPred_i = decay * _readElement(localVPred, i, bytes);
+                    const float v_i = _readElement(v_local, i, bytes);
+                    const float delta_i = beta_t * (v_i - vPred_i);
+                    const float out_i = decay * _readElement(o_t, i, bytes) + kq * delta_i;
+                    if (outputC4) {
+                        _writeAttentionOutput(outPtr, true, b, 0, hh, i, B, 1, H, d_v, out_i, bytes, pack);
+                    } else {
+                        _writeElement(o_t, i, out_i, bytes);
+                    }
+                    _writeElement(localDelta, i, delta_i, bytes);
+                }
+
+                // Pass 2: S = decay * S + k ⊗ delta.
+                gcore->MNNDecayRankOneUpdate((float*)state, (float*)k_local, (float*)localDelta, decay, d_k, d_v);
+            }
         }
     }
     MNN_CONCURRENCY_END();

@@ -84,13 +84,18 @@ public:
      */
     void initialize(const std::string& config_path) override {
         mLlm.reset(Llm::createLLM(config_path));
-        mLlm->set_config("{\"all_logits\":true}");
+        if (mLlm) {
+            mLlm->set_config("{\"all_logits\":true}");
+        }
     }
 
     /**
      * @brief Loads the LLM and initializes token IDs.
      */
     void load() override {
+        if (!mLlm) {
+            return;
+        }
         mLlm->load();
         mTokenTrueId = mLlm->tokenizer_encode("yes")[0];
         mTokenFalseId = mLlm->tokenizer_encode("no")[0];
@@ -111,6 +116,9 @@ public:
      * @return A vector of float scores, one for each document.
      */
     std::vector<float> compute_scores(const std::string& query, const std::vector<std::string>& documents) override {
+        if (!mLlm) {
+            return {};
+        }
         CHECK_LLM_RUNNING_RET(mLlm->getContext(), std::vector<float>());
         std::string prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
         prefix = prefix + "<Instruct>: " + mInstruct + "\n<Query>: " + query + "\n<Document>: ";
@@ -142,30 +150,22 @@ public:
         // printf("Total input length: %d\n", total_len);
         // input_embeds
         auto input_embeds = mLlm->embedding(input_ids);
-        // attention mask
-        auto attention_mask = _Input({1, 1, total_len, total_len}, NCHW, halide_type_of<float>());
-        auto ptr = attention_mask->writeMap<float>();
-        for (int i = 0; i < total_len; i++) {
-            for (int j = 0; j < total_len; j++) {
-                ptr[total_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
+        // Causal; beyond the shared prompt prefix every document sees only itself.
+        std::vector<int> docBounds;
+        docBounds.reserve(spans.size() + 1);
+        for (const auto& span : spans) {
+            if (docBounds.empty() || docBounds.back() != span.first) {
+                docBounds.push_back(span.first);
             }
+            docBounds.push_back(span.second);
         }
-        for (int i = 0; i < spans.size(); i++) {
-            for (int j = 0; j < spans.size(); j++) {
-                if (i == j) {
-                    continue;
-                }
-                int start_i = spans[i].first;
-                int end_i = spans[i].second;
-                int start_j = spans[j].first;
-                int end_j = spans[j].second;
-                for (int k = start_i; k < end_i; k++) {
-                    for (int l = start_j; l < end_j; l++) {
-                        ptr[total_len * k + l] = std::numeric_limits<float>::lowest();
-                    }
-                }
-            }
-        }
+        MaskRequest maskReq;
+        maskReq.type         = AttentionMaskType::CausalBlockDiagonal;
+        maskReq.seqLen       = total_len;
+        maskReq.rank         = 4;
+        maskReq.sharedPrefix = prefix_len;
+        maskReq.cuSeqlens    = &docBounds;
+        auto attention_mask = buildAttentionMask(maskReq);
         // position ids
         auto position_ids = _Input({1, total_len}, NCHW, halide_type_of<int>());
         auto pos_ptr = position_ids->writeMap<int>();
@@ -237,7 +237,9 @@ public:
      * @brief Loads the reranker model after initialization.
      */
     void load() override {
-        mLlm->load();
+        if (mLlm) {
+            mLlm->load();
+        }
     }
 
     /**
@@ -253,6 +255,9 @@ public:
      * @return A vector of float scores, one for each document.
      */
     std::vector<float> compute_scores(const std::string& query, const std::vector<std::string>& documents) override {
+        if (!mLlm) {
+            return {};
+        }
         CHECK_LLM_RUNNING_RET(mLlm->getContext(), std::vector<float>());
         constexpr int pad_token_id = 1;
         constexpr int eos_token_id = 2;
@@ -273,19 +278,29 @@ public:
         }
         const int batch = static_cast<int>(documents.size());
         const int total_len = max_len * batch;
-        auto attention_mask = _Input({batch, 1, 1, max_len}, NCHW, halide_type_of<float>());
-        auto mask_ptr = attention_mask->writeMap<float>();
+        // Key padding [batch,1,1,max_len], broadcast over queries. Rerankers are exported without
+        // transformer fusion, so this feeds a plain MatMul/Add/Softmax chain, not an Attention op.
+        std::vector<int> validLens;
+        validLens.reserve(all_ids.size());
+        for (const auto& ids : all_ids) {
+            validLens.push_back(static_cast<int>(ids.size()));
+        }
+        MaskRequest maskReq;
+        maskReq.type      = AttentionMaskType::KeyPadding;
+        maskReq.batch     = batch;
+        maskReq.kvSeqLen  = max_len;
+        maskReq.rank      = 4;  // -> {batch, 1, 1, max_len}
+        maskReq.validLens = &validLens;
+        auto attention_mask = buildAttentionMask(maskReq);
         std::vector<int> input_ids(total_len);
         int idx = 0;
         for (auto& ids : all_ids) {
-            int i = 0;
+            size_t i = 0;
             for (; i < ids.size(); i++, idx++) {
                 input_ids[idx] = ids[i];
-                mask_ptr[idx] = 0.0;
             }
-            for (; i < max_len; i++, idx++) {
+            for (; (int)i < max_len; i++, idx++) {
                 input_ids[idx] = pad_token_id;
-                mask_ptr[idx] = std::numeric_limits<float>::lowest();
             }
         }
         

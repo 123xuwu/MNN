@@ -19,7 +19,15 @@
 namespace MNN {
 bool WrapExecution::needWrap(const Tensor* input, Backend* curBackend) {
     auto curType = curBackend ? curBackend->type() : MNN_FORWARD_CPU;
-    if (curType == MNN_FORWARD_NN || curType >= MNN_CONVERT_QNN) {
+    // Core ML executes cached operator programs and needs the normal FP16/layout
+    // transfers. Other NN backends still own their complete delegated graph.
+#if !defined(MNN_COREML_ENABLED) || !MNN_COREML_ENABLED
+    if (curType == MNN_FORWARD_NN) {
+        return false;
+    }
+#endif
+    if (curType == MNN_FORWARD_QNN ||
+        curType >= MNN_CONVERT_QNN) {
         return false;
     }
     auto des = TensorUtils::getDescribeOrigin(input);
@@ -182,6 +190,7 @@ void WrapExecution::copyReplaceTensor(const Tensor* wrapTensor, Tensor* t) {
     TensorUtils::getDescribeOrigin(t)->mem = TensorUtils::getDescribeOrigin(wrapTensor)->mem;
     TensorUtils::getDescribeOrigin(t)->offset = TensorUtils::getDescribeOrigin(wrapTensor)->offset;
     TensorUtils::getDescribeOrigin(t)->setBackend( TensorUtils::getDescribeOrigin(wrapTensor)->getBackend());
+    TensorUtils::getDescribeOrigin(t)->cpuDynamicNode = TensorUtils::getDescribeOrigin(wrapTensor)->cpuDynamicNode;
     t->buffer().host = wrapTensor->buffer().host;
     t->buffer().device = wrapTensor->buffer().device;
     t->buffer().dim = TensorUtils::getDescribe(wrapTensor)->dims;

@@ -63,9 +63,12 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_QNN              | 是否构建`QNN`后端，默认为`OFF` |
 | MNN_QNN_ONLINE_FINALIZE | 在`MNN_QNN`开启的基础上,是否构建在线编译模式的QNN后端，默认为`ON` |
 | MNN_QNN_CONVERT_MODE | 在`MNN_QNN`开启的基础上,是否构建Convert模式的QNN后端，默认为`OFF` |
+| MNN_QNN_OFFLINE_CONTEXT | 是否构建按 Session 显式启用的 QNN Context 离线模型兼容能力，默认为`OFF` |
+| MNN_NPU_BACKENDS_SHARED | 是否将已启用的 QNN、NeuroPilot、HiAI 后端构建为各自独立的显式加载插件，默认为`OFF` |
 | MNN_RKNN             | 是否构建`RKNN`运行时与模型转换支持，依赖`MNN_WITH_PLUGIN=ON`和`RKNN_API_INCLUDE_DIR`，默认为`OFF` |
 | MNN_HEXAGON          | 是否构建高通`Hexagon DSP`后端，默认为`OFF` ，使用说明见 `source/backend/hexagon/README.md` |
 | MNN_HEXAGON_ASAN     | 是否开启Hexagon后端内部内存一致性检查，该宏仅在`MNN_HEXAGON=ON`时生效，默认为`OFF` |
+| MNN_HEXAGON_APP_POWER_HOLD | 是否在命令flush之间保持DSP电源投票并在空闲后释放（面向App进程），该宏仅在`MNN_HEXAGON=ON`时生效，默认为`OFF` |
 | MNN_NEUROPILOT            | 是否构建MLA的`NPU`离线转换后端或执行插件，默认为`OFF`  |
 | MNN_NPU            | 是否构建HIAI的`NPU`后端，默认为`OFF`  |
 | MNN_USE_SPARSE_COMPUTE | 是否使用稀疏计算，默认为`ON` |
@@ -80,8 +83,6 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_OPENCL_SIZE_CUT  | 是否为了降低OpenCL大小而关闭OpenCL Buffer实现，该宏仅在`MNN_OPENCL=ON`时生效，默认为`OFF` |
 | MNN_GPU_TIME_PROFILE | 是否打开OpenCL后端及Vulkan后端的Kernel性能Profile，该宏仅在`MNN_OPENCL=ON`或`MNN_VULKAN=ON`时生效，默认为`OFF` |
 | MNN_GPU_PROFILE_SILENT | 在GPU性能Profile开启时，仅累计总耗时而不打印每个Kernel的详细信息，可通过`Executor::getLastGpuTimeMs()`获取最近一次推理的GPU总耗时（毫秒），该宏仅在`MNN_GPU_TIME_PROFILE=ON`时生效，默认为`OFF` |
-| MNN_METALLIB_SOURCE  | 使用Metal时是否直接使用Metal源码，该宏仅在`MNN_METAL=ON`时生效，默认为`ON` |
-| MNN_VULKAN_DEBUG     | 是否打开Vulkan的DEBUG模式，该宏仅在`MNN_VULKAN=ON`时生效，默认为`OFF` |
 | MNN_OPENGL_REGEN     | 是否重新生成OpenGL Kenel，该宏仅在`MNN_OPENGL=ON`时生效，默认为`OFF` |
 | MNN_TRT_DYNAMIC      | 是否通过dlopen的方式引入TRT的动态库，该宏仅在`MNN_TENSORRT=ON`时生效，默认为`OFF` |
 | MNN_BUILD_TORCH      | 构建的`MNNConvert`是否支持`TorchScript`，该宏仅在`MNN_BUILD_CONVERTER=ON`时生效，默认为`OFF` |
@@ -107,8 +108,9 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_GATED_RMS_NORM   | 是否启用 GatedRMSNorm 的 Metal 原生融合 kernel，默认为 `ON` 。仅在 MNN_SUPPORT_TRANSFORMER_FUSE 打开时生效；关闭时仅去掉原生 kernel，shape 推导与 geometry 兜底分解（LayerNorm+SILU+MUL）仍然可用，含该算子的模型可正常运行 |
 | MNN_BUILD_LLM        | 是否构建基于MNN的llm库和demo，默认为`OFF` ，打开时 MNN_LOW_MEMORY , MNN_SUPPORT_TRANSFORMER_FUSE 对应开启|
 | MNN_BUILD_LLM_OMNI        | 若构建基于MNN的llm库和demo，是否支持图像和音频输入功能，默认为`OFF` 。仅在MNN_BUILD_LLM 打开时生效。开启时 MNN_BUILD_OPENCV , MNN_IMGCODECS , MNN_BUILD_AUDIO 同时打开|
+| MNN_LLM_TOKEN_COMPRESS | 是否启用LLM分词后的Token压缩，默认为`OFF`，仅在`MNN_BUILD_LLM=ON`时生效。运行时需在模型`config.json`中设置正整数`token_compress`，作为触发阈值和压缩后完整输入的Token上限；缺省或`0`关闭。用法和限制见[Token压缩](../transformers/llm.md#token压缩) |
 | MNN_BUILD_DIFFUSION  | 是否构建基于MNN的diffusion demo，默认为`OFF` . 打开时MNN_BUILD_OPENCV , MNN_IMGCODECS, MNN_LOW_MEMORY, MNN_SUPPORT_TRANSFORMER_FUSE 同步开启|
-| MNN_KLEIDIAI         | 是否集成ARM的klediAI加速库，默认为`ON` |
+| MNN_KLEIDIAI         | 是否集成ARM的klediAI加速库，默认为`OFF` |
 | MNN_KLEIDIAI_DEFAULT_ON | 是否默认使用KLEIDIAI的Kernel, 默认为`OFF` |
 | MNN_USE_RVV          | 是否启用RISC-V向量扩展支持，默认为`OFF` |
 | MNN_RVV_FAST_MATH    | 是否为RISC-V RVV优化Kernel启用`-ffast-math`，默认为`OFF` |

@@ -1,8 +1,13 @@
 #include "llm/llm.hpp"
+#include "../src/ujson.hpp"
 #include "core/MNNFileUtils.h"
+#include "Utils.hpp"
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
-#include "Profiler.hpp"
+#include <MNN/Interpreter.hpp>
+#include <MNN/Tensor.hpp>
+#include <chrono>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <regex>
@@ -13,6 +18,7 @@
 #include <rapidjson/writer.h>
 #include <thread>
 #include <algorithm>
+#include <cstring>
 #include <numeric>
 #include <memory>
 
@@ -32,7 +38,6 @@ struct RuntimeParameters {
     std::vector<int>                 memory;
     std::vector<int>                 dynamicOption;
     std::vector<int>                 divisionRatioSme2Neon;
-    std::vector<int>                 smeCoreNum;
     std::vector<int>                 quantKv;
     std::vector<int>                 flashAttention;
 };
@@ -56,7 +61,6 @@ struct CommandParameters {
     int                 memory;
     int                 dynamicOption;
     int                 divisionRatioSme2Neon;
-    int                 smeCoreNum;
     int                 quantKv;
     int                 flashAttention;
 
@@ -83,7 +87,6 @@ static const RuntimeParameters runtimeParamsDefaults = {
     /* memory               */ { 2 },
     /* dynamicOption        */ { 0 },
     /* divisionRatioSme2Neon*/ { 41 },
-    /* smeCoreNum             */ { 2 },
     /* quantKv              */  { 0 },
     /* flashAttention        */  { 1 }
 };
@@ -122,7 +125,6 @@ struct commandParametersInstance {
         mCmdParam.nRepeat        = cmdParam.nRepeat;
         mCmdParam.kvCache        = cmdParam.kvCache;
         mCmdParam.loadingTime    = cmdParam.loadingTime;
-        mCmdParam.smeCoreNum     = cmdParam.smeCoreNum;
         mCmdParam.sharedKv       = cmdParam.sharedKv;
     }
 
@@ -139,7 +141,6 @@ struct commandParametersInstance {
         mCmdParam.dynamicOption == other.mCmdParam.dynamicOption &&
         mCmdParam.quantKv == other.mCmdParam.quantKv &&
         mCmdParam.flashAttention == other.mCmdParam.flashAttention &&
-        mCmdParam.smeCoreNum == other.mCmdParam.smeCoreNum &&
         mCmdParam.divisionRatioSme2Neon == other.mCmdParam.divisionRatioSme2Neon;
     }
 };
@@ -156,10 +157,13 @@ template <typename T> static T stdev(const std::vector<T> & v) {
     if (v.size() <= 1) {
         return 0;
     }
-    T mean   = avg(v);
-    T sq_sum = std::inner_product(v.begin(), v.end(), v.begin(), T(0));
-    T stdev  = std::sqrt(sq_sum / (T) (v.size() - 1) - mean * mean * (T) v.size() / (T) (v.size() - 1));
-    return stdev;
+    const T mean = avg(v);
+    T sq_sum = 0;
+    for (const auto& value : v) {
+        const T delta = value - mean;
+        sq_sum += delta * delta;
+    }
+    return std::sqrt(sq_sum / (T) (v.size() - 1));
 }
 
 template <class T> static std::string join(const std::vector<T> & values, const std::string & delim) {
@@ -177,6 +181,7 @@ struct TestInstance {
 //    static const std::string build_commit;
     std::string              modelConfigFile;
     std::string              modelType;
+    std::string              delegate;
     uint64_t                 modelSize;
     int                      threads;
     bool                     useMmap;
@@ -185,6 +190,9 @@ struct TestInstance {
     std::vector<int64_t>     nGenerates;
     std::vector<int64_t>     prefillUs;
     std::vector<int64_t>     decodeUs;
+    // Wall-clock us for the decode phase (total response wall minus prefill),
+    // so it includes sampling and other host work that decode_us excludes.
+    std::vector<int64_t>     decodeWallUs;
     std::vector<int64_t>     samplesUs;
     std::vector<double>      loadingS;
     int                      backend;
@@ -193,7 +201,6 @@ struct TestInstance {
     int                      memory;
     int                      dynamicOption;
     int                      divisionRatioSme2Neon;
-    int                      smeCoreNum;
     int                      quantKv;
     int                      flashAttention;
     // true for `-pg` (and deprecated `-kv true`) rows: prefillUs/decodeUs are
@@ -213,7 +220,6 @@ struct TestInstance {
         power             = instance.mCmdParam.power;
         dynamicOption     = instance.mCmdParam.dynamicOption;
         divisionRatioSme2Neon = instance.mCmdParam.divisionRatioSme2Neon;
-        smeCoreNum        = instance.mCmdParam.smeCoreNum;
         quantKv    = instance.mCmdParam.quantKv;
         flashAttention     = instance.mCmdParam.flashAttention;
         sharedKv           = instance.mCmdParam.sharedKv;
@@ -354,9 +360,6 @@ struct markdownPrinter : public Printer {
             fields.emplace_back("flashAttention");
         }
 
-        if (!(rp.smeCoreNum.size() == 1 && rp.smeCoreNum[0] == runtimeParamsDefaults.smeCoreNum[0])) {
-            fields.emplace_back("smeCoreNum");
-        }
         if (rp.useMmap) {
             fields.emplace_back("useMmap");
         }
@@ -401,16 +404,23 @@ struct markdownPrinter : public Printer {
             if (field == "model") {
                 value = t.modelType;
             } else if (field == "modelSize") {
-                if (t.modelSize < 1024 * 1024 * 1024) {
+                if (!t.delegate.empty() && !t.modelSize) {
+                    snprintf(buf, sizeof(buf), "n/a");
+                } else if (t.modelSize < 1024 * 1024 * 1024) {
                     snprintf(buf, sizeof(buf), "%.2f MiB", t.modelSize / 1024.0 / 1024.0);
                 } else {
                     snprintf(buf, sizeof(buf), "%.2f GiB", t.modelSize / 1024.0 / 1024.0 / 1024.0);
                 }
                 value = buf;
             }  else if (field == "backend") {
-                if (t.backend == 1) value = "METAL";
+                if (!t.delegate.empty()) {
+                    value = t.delegate;
+                } else if (t.backend == 1) {
+                    value = "METAL";
+                }
                 else if (t.backend == 2) value = "CUDA";
                 else if (t.backend == 3) value = "OPENCL";
+                else if (t.backend == 7) value = "VULKAN";
                 else if (t.backend == 10) value = "HEXAGON";
                 else value = "CPU";
             } else if (field == "test") {
@@ -464,9 +474,6 @@ struct markdownPrinter : public Printer {
             } else if (field == "divisionRatioSme2Neon") {
                 snprintf(buf, sizeof(buf), "%d", t.divisionRatioSme2Neon);
                 value = buf;
-            } else if (field == "smeCoreNum") {
-                snprintf(buf, sizeof(buf), "%d", t.smeCoreNum);
-                value = buf;
             } else if (field == "quantKv") {
                 snprintf(buf, sizeof(buf), "%d", t.quantKv);
                 value = buf;
@@ -514,10 +521,19 @@ struct jsonAggregator : public Printer {
         writer.Key("model");
         writer.String(t.modelType.c_str());
         writer.Key("modelSize");
-        writer.Double(t.modelSize / 1024.0 / 1024.0 / 1024.0); // GB
+        if (!t.delegate.empty() && !t.modelSize) {
+            writer.Null();
+        } else {
+            writer.Double(t.modelSize / 1024.0 / 1024.0 / 1024.0); // GB
+        }
         writer.Key("backend");
-        if (t.backend == 1) writer.String("METAL");
+        if (!t.delegate.empty()) {
+            writer.String(t.delegate.c_str());
+        } else if (t.backend == 1) {
+            writer.String("METAL");
+        }
         else if (t.backend == 3) writer.String("OPENCL");
+        else if (t.backend == 7) writer.String("VULKAN");
         else if (t.backend == 10) writer.String("HEXAGON");
         else writer.String("CPU");
 
@@ -699,7 +715,6 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
     for (const auto & nt : rp.threads)
     for (const auto & dyop : rp.dynamicOption)
     for (const auto &mratio: rp.divisionRatioSme2Neon)
-    for (const auto &smeNum: rp.smeCoreNum)
     for (const auto & quantKv : rp.quantKv)
     for (const auto & flashAttn : rp.flashAttention)
         if (tp.kvCache == "true") { // deprecated: same as pairing every -p with every -n via -pg
@@ -729,7 +744,6 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
                     tmpParam.sharedKv = true;
                     tmpParam.loadingTime = tp.loadTime;
                     tmpParam.divisionRatioSme2Neon = mratio;
-                    tmpParam.smeCoreNum = smeNum;
                     auto instance = commandParametersInstance(tmpParam);
                     instances.push_back(instance);
                 }
@@ -756,7 +770,6 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
                 tmpParam.kvCache = "false";
                 tmpParam.loadingTime = tp.loadTime;
                 tmpParam.divisionRatioSme2Neon = mratio;
-                tmpParam.smeCoreNum = smeNum;
                 auto instance = commandParametersInstance(tmpParam);
                 instances.push_back(instance);
             }
@@ -781,7 +794,6 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
                 tmpParam.kvCache = "false";
                 tmpParam.loadingTime = tp.loadTime;
                 tmpParam.divisionRatioSme2Neon = mratio;
-                tmpParam.smeCoreNum = smeNum;
                 auto instance = commandParametersInstance(tmpParam);
                 instances.push_back(instance);
             }
@@ -809,7 +821,6 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
                 tmpParam.sharedKv = true;
                 tmpParam.loadingTime = tp.loadTime;
                 tmpParam.divisionRatioSme2Neon = mratio;
-                tmpParam.smeCoreNum = smeNum;
                 auto instance = commandParametersInstance(tmpParam);
                 instances.push_back(instance);
             }
@@ -819,27 +830,74 @@ static std::vector<commandParametersInstance> get_cmd_params_instances(const Run
 }
 
 std::string getDirectoryOf(const std::string& file_path, std::string& modelname) {
+    if (MNNDirExist(file_path.c_str())) {
+        return getDirectoryOf(MNNFilePathConcat(file_path, "config.json"), modelname);
+    }
+    size_t pos = file_path.find_last_of("/\\");
+    const auto filename = file_path.substr(pos == std::string::npos ? 0 : pos + 1);
+    if (filename.size() < 5 || filename.compare(filename.size() - 5, 5, ".json") != 0) {
+        modelname = filename;
+        if (filename.size() >= 4 && filename.compare(filename.size() - 4, 4, ".mnn") == 0) {
+            return file_path + ".weight";
+        }
+        return file_path;
+    }
     // weight filename
     std::string weight_name = "llm.mnn.weight";
-    std::ifstream file(file_path.c_str());
+    std::ifstream file(file_path.c_str(), std::ios::binary);
+    if (!file) {
+        MNN_ERROR("Cannot open model config: %s\n", file_path.c_str());
+        return "";
+    }
+    const unsigned char packageMagic[] = {0xae, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
+    unsigned char prefix[sizeof(packageMagic)];
+    if (file.read(reinterpret_cast<char*>(prefix), sizeof(prefix)) &&
+        std::memcmp(prefix, packageMagic, sizeof(prefix)) == 0) {
+        modelname = filename;
+        return file_path;
+    }
+    file.clear();
+    file.seekg(0);
     std::string json_str((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
     rapidjson::Document doc;
     doc.Parse(json_str.c_str());
 
+    if (doc.HasParseError() || !doc.IsObject()) {
+        MNN_ERROR("Invalid model config: %s\n", file_path.c_str());
+        return "";
+    }
     if (doc.HasMember("llm_weight") && doc["llm_weight"].IsString()) {
         weight_name = doc["llm_weight"].GetString();
     }
 
-    size_t pos = file_path.find_last_of("/\\");
-    if (pos == std::string::npos) {
-        MNN_ERROR("Invalid model config path\n");
-        return "";
-    }
-    auto dir = file_path.substr(0, pos);
+    auto dir = pos == std::string::npos ? std::string(".") : file_path.substr(0, pos);
     pos = dir.find_last_of("/\\");
     modelname = dir.substr(pos + 1, -1);
     return MNNFilePathConcat(dir, weight_name);
+}
+
+static bool modelFileSize(file_t file, uint64_t& size) {
+#if defined(__ANDROID__) && !defined(__LP64__)
+    struct stat64 info;
+    if (fstat64(file, &info) != 0 || info.st_size < 0) {
+        return false;
+    }
+    size = static_cast<uint64_t>(info.st_size);
+#elif (defined(WIN32) || defined(_WIN32) || defined(_MSC_VER)) && !defined(_WIN64)
+    LARGE_INTEGER info;
+    if (!GetFileSizeEx(file, &info) || info.QuadPart < 0) {
+        return false;
+    }
+    size = static_cast<uint64_t>(info.QuadPart);
+#else
+    const auto info = MNNGetFileSize(file);
+    if (info == INVALID_SIZE) {
+        return false;
+    }
+    size = static_cast<uint64_t>(info);
+#endif
+    return true;
 }
 
 static void printUsage(int /* argc */, char ** argv) {
@@ -858,7 +916,6 @@ static void printUsage(int /* argc */, char ** argv) {
     printf("  -rep, --n-repeat <n>                      (default: %s)\n", join(testParamsDefaults.nRepeat, ",").c_str());
     printf("  -kv, --kv-cache <true|false>              (default: %s) | Note: DEPRECATED, use -pg instead. `-p A -n B -kv true` == `-pg A,B`\n", "false");
     printf("  -fp, --file-print <stdout|filename>       (default: %s)\n", "stdout");
-    printf("  -scn, --sme-core-num <n>                  (default: 2) | Note: Specify the number of smeCoreNum to use.\n");
     printf("  -load, --loading-time <true|false>        (default: %s)\n", "true");
     printf("  -dyo, --dynamicOption <n>                 (default: 0) | Note: if set 8, trades higher memory usage for better decoding performance\n");
     printf("  -mr, --mixedSme2NeonRatio <n>             (default: 41) | Note: This parameter is intended to optimize multi-threaded inference performance on backends that support Arm SME instructions. The optimal ratio may vary across different models; we recommend trying values such as 41, 49, 33.\n");
@@ -866,6 +923,7 @@ static void printUsage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attention <0|1>              (default: 1) | Note: 1=enable flash attention, 0=disable\n");
     printf("  -j, --json <filename>                     (default: llm_bench.json) | Note: if set, output result to a JSON file\n");
     printf("  --profile                                 Enable operator-level profiling to print detailed timing statistics\n");
+    printf("\nBenchmark uses greedy sampling and ignores EOS for fixed-length workloads.\n");
 }
 
 
@@ -935,6 +993,8 @@ static bool parseCmdParams(int argc, char ** argv, RuntimeParameters & runtimePa
                     p.emplace_back(2);
                 } else if (type == "opencl") {
                     p.emplace_back(3);
+                } else if (type == "vulkan") {
+                    p.emplace_back(7);
                 } else if (type == "hexagon") {
                     p.emplace_back(10);
                 } else {
@@ -1027,13 +1087,6 @@ static bool parseCmdParams(int argc, char ** argv, RuntimeParameters & runtimePa
             }
             auto p = splitString<int>(argv[i], splitDelim);
             runtimeParams.divisionRatioSme2Neon.insert(runtimeParams.divisionRatioSme2Neon.end(), p.begin(), p.end());
-        } else if (arg == "-scn" || arg == "--sme-core-num") {
-            if (++i >= argc) {
-                invalidParam = true;
-                break;
-            }
-            auto p = splitString<int>(argv[i], splitDelim);
-            runtimeParams.smeCoreNum.insert(runtimeParams.smeCoreNum.end(), p.begin(), p.end());
         } else if (arg == "-qa" || arg == "-qatten" || arg == "--quant-attention") {
             if (++i >= argc) {
                 invalidParam = true;
@@ -1103,9 +1156,6 @@ static bool parseCmdParams(int argc, char ** argv, RuntimeParameters & runtimePa
     if (runtimeParams.divisionRatioSme2Neon.empty()) {
         runtimeParams.divisionRatioSme2Neon = runtimeParamsDefaults.divisionRatioSme2Neon;
     }
-    if (runtimeParams.smeCoreNum.empty()) {
-        runtimeParams.smeCoreNum = runtimeParamsDefaults.smeCoreNum;
-    }
     if (runtimeParams.quantKv.empty()) {
         runtimeParams.quantKv = runtimeParamsDefaults.quantKv;
     }
@@ -1120,17 +1170,27 @@ static bool parseCmdParams(int argc, char ** argv, RuntimeParameters & runtimePa
 }
 
 
-static Llm* buildLLM(const std::string& config_path, int backend, int memory, int precision, int threads, int power, int dynamic_option, bool use_mmap, int divisionRatioSme2Neon, int smeCoreNum, int promptLen, int quant_kv, int flash_attention) {
-    auto llmPtr = Llm::createLLM(config_path);
+static Llm* buildLLM(const std::string& config_path, int backend, int memory, int precision, int threads, int power, int dynamic_option, bool use_mmap, int divisionRatioSme2Neon, int promptLen, int quant_kv, int flash_attention) {
+    const auto path = MNNDirExist(config_path.c_str()) ? MNNFilePathConcat(config_path, "config.json") : config_path;
+    auto llmPtr = Llm::createLLM(path);
+    if (!llmPtr) {
+        MNN_ERROR("Cannot create LLM from: %s\n", config_path.c_str());
+        return nullptr;
+    }
+    // Every repetition must execute the requested number of decode steps.
+    // Random sampling + EOS otherwise changes the workload and inflates tgN
+    // throughput when N is divided by the time of an early-stopped response.
     llmPtr->set_config(R"({
-        "async":false
+        "async":false,
+        "sampler_type":"greedy",
+        "ignore_eos":true
     })");
     // "Set reuse_kv=false for multiple test runs.
     // Otherwise, mContext->history_tokens retains data after the first run, skewing true prefill performance metrics."
     llmPtr->set_config(R"({"reuse_kv":false})");
     std::map<int, std::string> lever = {{0,"normal"}, {1, "high"}, {2, "low"}};
     std::map<int, std::string> backend_type = {
-        {0, "cpu"}, {1, "metal"}, {2, "cuda"}, {3, "opencl"}, {10, "hexagon"}};
+        {0, "cpu"}, {1, "metal"}, {2, "cuda"}, {3, "opencl"}, {7, "vulkan"}, {10, "hexagon"}};
     std::map<bool, std::string> mmap = {{true,"true"}, {false, "false"}};
 
     bool setSuccess = true;
@@ -1186,17 +1246,97 @@ static Llm* buildLLM(const std::string& config_path, int backend, int memory, in
         MNN_ERROR("cpu_sme2_neon_division_ratio for LLM config set error\n");
         return nullptr;
     }
-    setSuccess &= llmPtr->set_config("{\"cpu_sme_core_num\":" + std::to_string(smeCoreNum) + "}");
-    if (!setSuccess) {
-        MNN_ERROR("cpu_sme_core_num for LLM config set error\n");
-        return nullptr;
-    }
     return llmPtr;
 }
 
 static void tuning_prepare(Llm* llm) {
     llm->tuning(OP_ENCODER_NUMBER, {1, 5, 10, 20, 30, 50, 100});
 }
+
+static bool validSample(const LlmContext* context, int promptTokens, int decodeTokens) {
+    const auto status = context->status;
+    if (status == LlmStatus::NOT_LOADED || status == LlmStatus::INTERNAL_ERROR ||
+        status == LlmStatus::TIMEOUT || status == LlmStatus::USER_CANCEL ||
+        (promptTokens > 0 && context->prefill_us <= 0) ||
+        (decodeTokens > 0 && (status == LlmStatus::NORMAL_FINISHED || context->decode_us <= 0))) {
+        MNN_ERROR("[llm_bench] Incomplete sample: status=%d, generated=%d, requested=%d, "
+                  "prefill_us=%lld, decode_us=%lld\n", static_cast<int>(status), context->gen_seq_len,
+                  decodeTokens, (long long)context->prefill_us, (long long)context->decode_us);
+        return false;
+    }
+    return true;
+}
+
+// Shapes describe the first measured call, not subsequent KV growth.
+struct BenchProfile {
+    using Clock = std::chrono::steady_clock;
+    struct Record {
+        std::string inputs, outputs;
+        int64_t calls = 0;
+        double totalUs = 0.0;
+    };
+    bool active = false;
+    Record* current = nullptr;
+    Clock::time_point start;
+    std::map<std::pair<std::string, std::string>, Record> records[2]; // prefill / decode, type + name
+
+    static std::string shapes(const std::vector<MNN::Tensor*>& tensors) {
+        std::string result;
+        for (auto tensor : tensors) {
+            if (!result.empty()) result += ";";
+            result += tensor ? "[" + join(tensor->shape(), ",") + "]" : "null";
+        }
+        return result.empty() ? "-" : result;
+    }
+    static std::string tsv(std::string text) {
+        for (auto& c : text) {
+            if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+        }
+        return text;
+    }
+    void before(Llm* llm, const std::vector<MNN::Tensor*>& inputs, const MNN::OperatorInfo* info) {
+        if (!active) return;
+        // generate_init resets to zero; AR increments before every decode forward (including the first).
+        auto& record = records[llm->getContext()->gen_seq_len > 0][{info->type(), info->name()}];
+        current = &record;
+        if (record.calls == 0) record.inputs = shapes(inputs);
+        start = Clock::now(); // All phase/name/type/input metadata lookup is outside the timed interval.
+    }
+    void after(const std::vector<MNN::Tensor*>& outputs) {
+        if (!active) return;
+        for (auto o : outputs) {
+            o->wait(MNN::Tensor::MAP_TENSOR_READ, true);
+        }
+        const auto end = Clock::now();
+        current->totalUs += std::chrono::duration<double, std::micro>(end - start).count();
+        if (current->calls == 0) current->outputs = shapes(outputs);
+        ++current->calls;
+    }
+    void print(FILE* out) const {
+        const bool byName = std::getenv("MNN_LLM_BENCH_PROFILE_NAME") != nullptr;
+        fprintf(out, "PROF\tphase\ttype\tname\tinputs\toutputs\tcalls\ttotal_us\n");
+        for (int phase = 0; phase < 2; ++phase) {
+            const char* label = phase ? "decode" : "prefill";
+            std::map<std::string, Record> byType;
+            for (const auto& entry : records[phase]) {
+                const auto& record = entry.second;
+                auto& total = byType[entry.first.first];
+                total.calls += record.calls;
+                total.totalUs += record.totalUs;
+                if (byName) {
+                    fprintf(out, "PROF\t%s\t%s\t%s\t%s\t%s\t%lld\t%.3f\n", label,
+                            tsv(entry.first.first).c_str(), tsv(entry.first.second).c_str(), record.inputs.c_str(),
+                            record.outputs.c_str(), (long long)record.calls, record.totalUs);
+                }
+            }
+            // '*' marks type totals, not another named operator.
+            for (const auto& entry : byType) {
+                fprintf(out, "PROF\t%s\t%s\t*\t-\t-\t%lld\t%.3f\n", label, tsv(entry.first).c_str(),
+                        (long long)entry.second.calls, entry.second.totalUs);
+            }
+        }
+    }
+};
 
 int main(int argc, char ** argv) {
     RuntimeParameters runtimeParams;
@@ -1240,12 +1380,18 @@ int main(int argc, char ** argv) {
 
     bool printHeader = true;
 
+    bool notedPackageSize = false;
     for (const auto & instance: paramsInstances) {
         TestInstance t(instance);
         auto llmWeightPath = getDirectoryOf(t.modelConfigFile, t.modelType); // To check path
-
-        file_t file = MNNOpenFile(llmWeightPath.c_str(), MNN_FILE_READ);
-        t.modelSize = MNNGetFileSize(file);
+        if (llmWeightPath.empty()) {
+            return 1;
+        }
+        if (llmWeightPath == t.modelConfigFile && !notedPackageSize) {
+            fprintf(stderr, "[llm_bench] modelSize is the full file size for single-file models; "
+                            "for config.json it is the weight file size.\n");
+            notedPackageSize = true;
+        }
 
         MNN::BackendConfig backendConfig;
         // Map backend parameter to MNN forward type (0=CPU, 1=METAL, 2=CUDA, 3=OPENCL)
@@ -1253,33 +1399,58 @@ int main(int argc, char ** argv) {
         auto executor = MNN::Express::Executor::newExecutor(forwardType, backendConfig, 1);
         MNN::Express::ExecutorScope scope(executor);
 
-        auto llmPtr = buildLLM(instance.mCmdParam.model, instance.mCmdParam.backend, instance.mCmdParam.memory, instance.mCmdParam.precision, instance.mCmdParam.threads, instance.mCmdParam.power, instance.mCmdParam.dynamicOption, instance.mCmdParam.useMmap, instance.mCmdParam.divisionRatioSme2Neon, instance.mCmdParam.smeCoreNum, instance.mCmdParam.nPrompt, instance.mCmdParam.quantKv, instance.mCmdParam.flashAttention);
+        BenchProfile profile;
+        auto llmPtr = buildLLM(instance.mCmdParam.model, instance.mCmdParam.backend, instance.mCmdParam.memory, instance.mCmdParam.precision, instance.mCmdParam.threads, instance.mCmdParam.power, instance.mCmdParam.dynamicOption, instance.mCmdParam.useMmap, instance.mCmdParam.divisionRatioSme2Neon, instance.mCmdParam.nPrompt, instance.mCmdParam.quantKv, instance.mCmdParam.flashAttention);
+        if (!llmPtr) {
+            return 1;
+        }
         std::unique_ptr<Llm> llm(llmPtr);
+        const auto config = ujson::json::parse(llm->dump_config());
+        t.delegate = config.value("delegate", "");
+        if (!t.delegate.empty()) {
+            const auto size = config["model_size_bytes"];
+            t.modelSize = size.is_number_unsigned() ? size.get<uint64_t>() : 0;
+        } else {
+            file_t file = MNNOpenFile(llmWeightPath.c_str(), MNN_FILE_READ);
+            if (file == INVALID_FILE) {
+                MNN_ERROR("Cannot open model file: %s\n", llmWeightPath.c_str());
+                return 1;
+            }
+            const bool gotSize = modelFileSize(file, t.modelSize);
+            MNNCloseFile(file);
+            if (!gotSize) {
+                MNN_ERROR("Cannot determine model size: %s\n", llmWeightPath.c_str());
+                return 1;
+            }
+        }
         if (enableProfile) {
             llm->set_config(R"({"enable_debug":true})");
-            auto profiler = MNN::Profiler::getInstance();
             llm->setDebugCallback(
-                [profiler](const std::vector<MNN::Tensor*>& inputs, const MNN::OperatorInfo* info) {
-                    profiler->start(info);
+                [&profile, llmPtr](const std::vector<MNN::Tensor*>& inputs, const MNN::OperatorInfo* info) {
+                    profile.before(llmPtr, inputs, info);
                     return true;
                 },
-                [profiler](const std::vector<MNN::Tensor*>& outputs, const MNN::OperatorInfo* info) {
-                    for (auto o : outputs) {
-                        o->wait(MNN::Tensor::MAP_TENSOR_READ, true);
-                    }
-                    profiler->end(info);
+                [&profile](const std::vector<MNN::Tensor*>& outputs, const MNN::OperatorInfo*) {
+                    profile.after(outputs);
                     return true;
                 }
             );
+            const auto debug = llm->getExecutor()->getDebugTools();
+            if (!debug || !debug->before || !debug->after) {
+                MNN_ERROR("[llm_bench] Operator profiling is unavailable for this model.\n");
+                return 1;
+            }
         }
         if (instance.mCmdParam.loadingTime == "true") {
             for (int k = 0; k < 3; ++k) {
                 Timer loadingCost;
-                llm->load();
+                if (!llm->load()) {
+                    return 1;
+                }
                 t.loadingS.push_back((double)loadingCost.durationInUs() / 1e6);
             }
-        } else {
-            llm->load();
+        } else if (!llm->load()) {
+            return 1;
         }
         std::shared_ptr<MNN::Express::Executor::Activation> act = llm->getExecutor()->activte();
         tuning_prepare(llm.get());
@@ -1300,21 +1471,25 @@ int main(int argc, char ** argv) {
             std::vector<int> tokens(prompt_tokens, 16);
 
             for (int i = 0; i < instance.mCmdParam.nRepeat + 1; ++i) {
+                profile.active = enableProfile && i > 0;
                 // switchMode handles OpenCL record queue: off for prefill, on for decode
                 if (isOpenCL) {
                     llm->switchMode(Llm::Prefill);
                 }
+                Timer wallCost;
                 llm->response(tokens, nullptr, nullptr, decodeTokens);
+                int64_t wallUs = wallCost.durationInUs();
+                profile.active = false;
+                if (!validSample(context, prompt_tokens, decodeTokens)) {
+                    return 1;
+                }
                 auto prefillTime = context->prefill_us;
                 auto decodeTime = context->decode_us;
                 if (i > 0) { // Exclude the first performance value.
                     t.prefillUs.push_back(prefillTime);
                     t.decodeUs.push_back(decodeTime);
-                    if (llm->stoped()) {
-                        t.nGenerates.push_back(context->gen_seq_len - 1);
-                    } else {
-                        t.nGenerates.push_back(context->gen_seq_len);
-                    }
+                    t.decodeWallUs.push_back(std::max<int64_t>(wallUs - prefillTime, 1));
+                    t.nGenerates.push_back(context->gen_seq_len);
                 }
             }
             if (printHeader) {
@@ -1322,6 +1497,11 @@ int main(int argc, char ** argv) {
                 printHeader = false;
             }
             printer_->printPerformance(t);
+            if (!t.decodeWallUs.empty()) {
+                auto wallSpeed = t.getTokensPerSecond(t.nGenerates, t.decodeWallUs);
+                fprintf(outfile, "decode wall speed (incl. sampling): %.2f ± %.2f tok/s\n", t.getAvgUs(wallSpeed),
+                        t.getStdevUs(wallSpeed));
+            }
             // Cool
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -1333,41 +1513,31 @@ int main(int argc, char ** argv) {
             std::vector<int> tokens1(1, tok);
 
             for (int i = 0; i < instance.mCmdParam.nRepeat + 1; ++i) {
+                profile.active = enableProfile && i > 0;
                 int64_t sampler_us = 0;
                 if (prompt_tokens) {
                     // Disable record queue during prefill for OpenCL
                     if (isOpenCL) {
                         llm->switchMode(Llm::Prefill);
                     }
-                    Timer prefillCost;
-                    llm->response(tokens, nullptr, nullptr, decodeTokens > 0 ? 1 : 0);
-                    int64_t prefill_us = context->prefill_us;
-                    if (prefill_us <= 0) {
-                        prefill_us = static_cast<int64_t>(prefillCost.durationInUs());
+                    llm->response(tokens, nullptr, nullptr, 0);
+                    if (!validSample(context, prompt_tokens, 0)) {
+                        return 1;
                     }
-                    sampler_us += prefill_us;
+                    sampler_us += context->prefill_us;
                 }
                 if (decodeTokens) {
                     // Enable record queue during decode for OpenCL
                     if (isOpenCL) {
                         llm->switchMode(Llm::Decode);
                     }
-                    Timer decodeCost;
                     llm->response(tokens1, nullptr, nullptr, decodeTokens);
-                    int64_t decode_us = context->decode_us;
-                    if (decode_us <= 0) {
-                        decode_us = static_cast<int64_t>(decodeCost.durationInUs());
-                        int64_t generatedTokens = context->gen_seq_len;
-                        if (llm->stoped() && generatedTokens > 0) {
-                            generatedTokens -= 1;
-                        }
-                        generatedTokens = std::max<int64_t>(generatedTokens, 1);
-                        if (generatedTokens < decodeTokens) {
-                            decode_us = (decode_us * decodeTokens + generatedTokens - 1) / generatedTokens;
-                        }
+                    if (!validSample(context, 0, decodeTokens)) {
+                        return 1;
                     }
-                    sampler_us += decode_us;
+                    sampler_us += context->decode_us;
                 }
+                profile.active = false;
                 if (i > 0) {
                     t.samplesUs.push_back(sampler_us);
                 }
@@ -1382,15 +1552,9 @@ int main(int argc, char ** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
         }
-    }
-
-    if (enableProfile) {
-        auto profiler = MNN::Profiler::getInstance();
-        fprintf(stdout, "\n========== Operator Profile Results ==========\n");
-        if (std::getenv("MNN_LLM_BENCH_PROFILE_NAME") != nullptr) {
-            profiler->printTimeByName(1);
+        if (enableProfile) {
+            profile.print(outfile);
         }
-        profiler->printTimeByType(1);
     }
 
     fprintf(stdout, "\n");

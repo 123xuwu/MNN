@@ -9,12 +9,30 @@ class ModelMapper:
 
     def get_map(self, config):
         model_type = config.model_type
+        if model_type in ('minicpmv4_7', 'minicpm_ocr'):
+            text_type = config.text_config.model_type
+            backbones = {'qwen3_5_text': 'qwen3_5', 'qwen3_5_moe_text': 'qwen3_5_moe'}
+            if text_type not in backbones:
+                raise ValueError(f'Unsupported {model_type} text model: {text_type}')
+            model_map = copy.deepcopy(self.mapper[backbones[text_type]])
+            model_map['model'].update({
+                'visual': 'model.vision_tower',
+                'visual.merger': 'model.merger',
+            })
+            return model_type, model_map
         if model_type == 'chatglm':
             if hasattr(config, 'vocab_size') and config.vocab_size == 130528:
                 model_type = 'chatglm'
             else:
                 model_type = 'chatglm2'
         if model_type in self.mapper:
+            text_config = getattr(config, 'text_config', config)
+            if model_type in ('lfm3', 'lfm3_vl', 'lfm3_audio', 'lfm3_omni') and not text_config.use_sandwich_norm:
+                model_map = copy.deepcopy(self.mapper[model_type])
+                model_map['decoder']['post_attention_layernorm'] = 'ffn_norm'
+                del model_map['decoder']['pre_feedforward_layernorm']
+                del model_map['decoder']['post_feedforward_layernorm']
+                return model_type, model_map
             return model_type, self.mapper[model_type]
         return model_type, self.default_map
 
@@ -214,6 +232,26 @@ class ModelMapper:
             'attention': llama4_text_attention
         }
         self.regist('llama4_text', llama4_text_map)
+
+    def regist_mobilemoe(self):
+        decoder = dict(self.default_decoder, mlp='feed_forward')
+        attention = dict(self.default_attention, qk_norm='qk_norm')
+        self.regist('mobilemoe', {
+            'config': self.default_config,
+            'model': self.default_model,
+            'decoder': decoder,
+            'attention': attention,
+            'mlp': {
+                'num_experts': 'num_experts',
+                'top_k': 'top_k',
+                'norm_topk_prob': 'norm_topk_prob',
+                'gate': 'router',
+                'experts': 'experts',
+                'expert_bias': 'expert_bias',
+                'routed_scaling_factor': 'routed_scaling_factor',
+                'shared_expert': 'shared_expert',
+            },
+        })
 
     def regist_qwen3_moe(self):
         qwen3_attention = {
@@ -686,8 +724,20 @@ class ModelMapper:
             'final_layernorm': 'model.language_model.norm',
             'visual': 'model.visual'
         }
+        # transformers>=5.0 nests text fields under `text_config.*` and drops the
+        # flat top-level attributes; list each candidate so both layouts resolve.
+        qwen2vl_config = {
+            'hidden_size': ['text_config.hidden_size', 'hidden_size'],
+            'head_dim': ['text_config.head_dim', 'head_dim'],
+            'num_attention_heads': ['text_config.num_attention_heads', 'num_attention_heads'],
+            'num_hidden_layers': ['text_config.num_hidden_layers', 'num_hidden_layers'],
+            'num_key_value_heads': ['text_config.num_key_value_heads', 'num_key_value_heads'],
+            'rope_theta': ['text_config.rope_theta', 'rope_theta'],
+            'rope_scaling': ['text_config.rope_scaling', 'rope_scaling'],
+            'max_position_embeddings': ['text_config.max_position_embeddings', 'max_position_embeddings']
+        }
         qwen2vl_map = {
-            'config': self.default_config,
+            'config': qwen2vl_config,
             'model': qwen2vl_model,
             'decoder': self.default_decoder,
             'attention': self.default_attention
@@ -967,6 +1017,49 @@ class ModelMapper:
             'linear_attention': lfm2_linear_attention,
         }
         self.regist('lfm2', lfm2_map)
+
+    def regist_lfm3(self):
+        lfm3_map = copy.deepcopy(self.mapper['lfm2'])
+        del lfm3_map['config']['rope_theta']
+        lfm3_map['config'].update({
+            'head_dim': 'head_dim',
+            'sliding_window': 'sliding_window',
+            'tie_word_embeddings': 'tie_word_embeddings',
+        })
+        lfm3_map['decoder'].update({
+            'post_attention_layernorm': 'post_operator_norm',
+            'pre_feedforward_layernorm': 'ffn_norm',
+            'post_feedforward_layernorm': 'post_ffn_norm',
+        })
+        lfm3_map['attention'] = dict(self.default_attention, head_gate_proj='gate_proj')
+        self.regist('lfm3', lfm3_map)
+
+    def regist_lfm3_multimodal(self):
+        model_map = copy.deepcopy(self.mapper['lfm3'])
+        model_map['config'] = {key: 'text_config.' + value for key, value in model_map['config'].items()}
+        model_map['model'] = {
+            'lm': 'lm_head',
+            'embed': 'model.language_model.embed_tokens',
+            'blocks': 'model.language_model.layers',
+            'final_layernorm': 'model.language_model.embedding_norm',
+            'visual': 'model.vision_tower',
+            'multi_modal_projector': 'model.multi_modal_projector',
+        }
+        self.regist('lfm3_vl', model_map)
+        audio_map = copy.deepcopy(model_map)
+        del audio_map['model']['visual']
+        del audio_map['model']['multi_modal_projector']
+        audio_map['model'].update({
+            'audio': 'model.audio_encoder',
+            'audio_projector': 'model.audio_projector',
+        })
+        self.regist('lfm3_audio', audio_map)
+        omni_map = copy.deepcopy(model_map)
+        omni_map['model'].update({
+            'audio': 'model.audio_encoder',
+            'audio_projector': 'model.audio_projector',
+        })
+        self.regist('lfm3_omni', omni_map)
 
     def regist_lfm2_moe(self):
         lfm2_moe_config = {
@@ -1248,12 +1341,20 @@ class ModelMapper:
         # e.g., 'visual' is processed before 'visual.connector' for SmolVLM
         for dst_path, src_path in sorted(mapping.items(), key=lambda x: x[0]):
             # --- 1. Retrieve value from source ---
-            val = src
-            for attr in src_path.split('.'):
-                if hasattr(val, attr):
-                    val = getattr(val, attr)
-                else:
-                    val = None
+            # `src_path` may be a list of candidate paths (e.g.
+            # ['text_config.hidden_size', 'hidden_size']); the first candidate
+            # that resolves to a non-None value wins.
+            candidates = src_path if isinstance(src_path, (list, tuple)) else [src_path]
+            val = None
+            for candidate in candidates:
+                val = src
+                for attr in candidate.split('.'):
+                    if hasattr(val, attr):
+                        val = getattr(val, attr)
+                    else:
+                        val = None
+                        break
+                if val is not None:
                     break
 
             # --- 2. Navigate to destination parent node ---

@@ -1,3 +1,4 @@
+import copy
 import os
 import torch
 import importlib
@@ -11,6 +12,7 @@ from utils.config import LlmConfig
 from utils.tokenizer import LlmTokenizer
 from utils.model_mapper import ModelMapper
 from utils.transformers import Embedding, Rotary, Decoder, Lm
+from utils.qat import mark_qat_sources, filter_qat_unexpected_keys
 
 
 def remap_hunyuan_vl_state_dict(state_dict):
@@ -67,6 +69,27 @@ def load_hunyuan_vl_state_dict(model_path):
     return state_dict
 
 
+def load_mobilemoe(model_path, config, **load_kwargs):
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    remote_class = get_class_from_dynamic_module(config.auto_map['AutoModelForCausalLM'], model_path)
+    # The released remote code uses the Transformers 4.x tied-weight API.
+    if Version(importlib.metadata.version('transformers')) >= Version('5.0.0'):
+        class MobileMoEForExport(remote_class):
+            config_class = type(config)
+            _tied_weights_keys = {'lm_head.weight': 'model.embed_tokens.weight'}
+        remote_class = MobileMoEForExport
+
+    # Its scaled RoPE constructor reads tensor values, which is invalid on meta.
+    # Defer only the non-persistent RoPE buffer until weights have been loaded.
+    load_config = copy.deepcopy(config)
+    load_config.rope_scaling = None
+    model = remote_class.from_pretrained(model_path, config=load_config, **load_kwargs)
+    model.config.rope_scaling = config.rope_scaling
+    model.model.rotary_emb = type(model.model.rotary_emb)(config, device='cpu')
+    return model
+
+
 class LlmModel(PreTrainedModel):
     config_class = LlmConfig
 
@@ -79,6 +102,7 @@ class LlmModel(PreTrainedModel):
         self.visual = None
         self.audio = None
         self.talker = None
+        self.speech = None
         self.token2wav = None
         self.mtp = None
         self.scale_emb = None
@@ -110,7 +134,7 @@ class LlmModel(PreTrainedModel):
 
     def get_config(self):
         llm_config = {}
-        models = ['visual', 'audio', 'talker']
+        models = ['visual', 'audio', 'talker', 'speech']
         for m in models:
             if hasattr(self, m) and getattr(self, m) is not None:
                 m_config = getattr(self, m).get_config()
@@ -136,8 +160,13 @@ class LlmModel(PreTrainedModel):
             'funaudiochat': 'AutoModelForSeq2SeqLM',
             'glm_ocr': 'GlmOcrForConditionalGeneration',
             'lfm2_vl': 'Lfm2VlForConditionalGeneration',
+            'lfm3_vl': 'AutoModelForImageTextToText',
+            'lfm3_audio': 'AutoModelForMultimodalLM',
+            'lfm3_omni': 'AutoModelForMultimodalLM',
             'gemma4': 'Gemma4ForConditionalGeneration',
             'hunyuan_vl': 'HunYuanVLForConditionalGeneration',
+            'minicpmv4_7': 'MiniCPMV4_7ForConditionalGeneration',
+            'minicpm_ocr': 'MiniCPMOcrForConditionalGeneration',
         }
         if model_type is None or model_type not in MODEL_CLASS_MAPPING:
             return AutoModelForCausalLM
@@ -154,6 +183,7 @@ class LlmModel(PreTrainedModel):
         config.export_args = args
         model_type = config.model_type
         model_class = cls.get_model_class(model_type)
+        source_names = None
 
         load_kwargs = {'trust_remote_code': True}
         if Version(importlib.metadata.version("transformers")) >= Version("4.56.0"):
@@ -181,6 +211,8 @@ class LlmModel(PreTrainedModel):
                     original_model = AutoModelForCausalLM.from_config(original_config, trust_remote_code=True)
                 original_model.to_empty(device="cpu")
                 cls._sanitize_skip_weight_tensors(original_model)
+        elif model_type == 'mobilemoe':
+            original_model = load_mobilemoe(pretrained_model_name_or_path, config.origin_config, **load_kwargs)
         elif model_type == 'lfm2_audio':
             # LFM2-Audio uses liquid_audio package, not standard HF class
             from pathlib import Path
@@ -199,8 +231,13 @@ class LlmModel(PreTrainedModel):
                     original_model = model_class._from_config(original_config)
                 else:
                     original_model = model_class(original_config)
-                state_dict = remap_hunyuan_vl_state_dict(load_hunyuan_vl_state_dict(pretrained_model_name_or_path))
+                state_dict = load_hunyuan_vl_state_dict(pretrained_model_name_or_path)
+                if args is not None and getattr(args, 'qat', False):
+                    source_names = remap_hunyuan_vl_state_dict({key: key for key in state_dict})
+                state_dict = remap_hunyuan_vl_state_dict(state_dict)
                 missing, unexpected = original_model.load_state_dict(state_dict, strict=False)
+                if args is not None and getattr(args, 'qat', False):
+                    unexpected = filter_qat_unexpected_keys(unexpected, state_dict, args)
                 if missing or unexpected:
                     raise RuntimeError(
                         "HunyuanVL fallback weight load mismatch: "
@@ -224,6 +261,8 @@ class LlmModel(PreTrainedModel):
             original_model = adapter.merge_and_unload(progressbar=True)
 
         original_model = original_model.eval()
+        if args is not None and getattr(args, 'qat', False):
+            mark_qat_sources(original_model, args, source_names)
         model = cls(config, args)
 
         ModelMapper.do_map(model, original_model, config.model_map['model'])
@@ -234,6 +273,8 @@ class LlmModel(PreTrainedModel):
         )
 
         # Rebuild modules
+        if args is not None and getattr(args, 'qat', False):
+            source_lm = model.lm if model.lm is not None else model.embed
         if model.lm is None:
             out_features, in_features = model.embed.weight.shape
             model.lm = torch.nn.Linear(in_features, out_features, bias=False)
@@ -243,13 +284,16 @@ class LlmModel(PreTrainedModel):
             out_features, in_features = weight.shape
             model.lm = torch.nn.Linear(in_features, out_features, bias=False)
             model.lm.weight = weight
+        if args is not None and getattr(args, 'qat', False) and model.lm is not source_lm:
+            from utils.qat import copy_qat_source
+            copy_qat_source(source_lm, model.lm)
 
         model.embed = Embedding(model.embed, config)
 
-        # gemma3/gemma3_text/gemma4: dual rotary for sliding vs full attention layers
+        # Separate rotary for sliding vs full attention layers.
         # rope_parameters has form {'sliding_attention': {'rope_theta': ...}, 'full_attention': {'rope_theta': ...}}
         _rp = getattr(config, 'rope_parameters', None)
-        _is_dual_rope = (model_type in ('gemma3', 'gemma3_text', 'gemma4')
+        _is_dual_rope = ((model_type in ('gemma3', 'gemma3_text', 'gemma4') or model_type.startswith('lfm3'))
                          and _rp is not None
                          and isinstance(_rp, dict)
                          and any(isinstance(v, dict) for v in _rp.values()))
@@ -284,7 +328,11 @@ class LlmModel(PreTrainedModel):
             })()
             model.rotary_full = Rotary(full_config)
             # Adjust rotary_dim for partial rotary factor
-            if partial_factor < 1.0:
+            if partial_factor < 1.0 and model_type.startswith('lfm3'):
+                # LFM3 rotates across the full head halves, with zero frequencies in the tail.
+                model.rotary_full.theta[int(global_head_dim * partial_factor) // 2:] = 0
+                model.rotary_full.build_rope_tables()
+            elif partial_factor < 1.0:
                 rotary_dim = int(global_head_dim * partial_factor)
                 model.rotary_full.rotary_dim = rotary_dim
                 model.rotary_full.theta = 1.0 / (full_rp.get('rope_theta', 1000000.0) ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / global_head_dim))
@@ -336,6 +384,10 @@ class LlmModel(PreTrainedModel):
                 model.talker = talker_cls(model.talker, getattr(model, 'token2wav', None), model)
             else:
                 model.talker = None
+        if model_type in ('lfm3_audio', 'lfm3_omni'):
+            from utils.talker import Lfm3Speech
+            model.speech = Lfm3Speech(original_model.model, pretrained_model_name_or_path,
+                                     original_model.generation_config)
         if model_type == 'poi_qwen2_mtp':
             model.mtp = [model.mtp1, model.mtp2]
         if model.mtp is not None:
@@ -354,7 +406,7 @@ class LlmModel(PreTrainedModel):
                 audio_pad_id = self.audio.config.audio_token_id
                 audio_mask = (input_ids == audio_pad_id).squeeze()
                 if audio_mask.any():
-                    embed_scale = self.config.hidden_size ** 0.5
+                    embed_scale = self.audio.embedding_scale
                     result[audio_mask] = self.audio.audio_embeds.to(result.dtype) / embed_scale
                     self.audio.audio_embeds = None
             return result
@@ -621,10 +673,14 @@ class EmbeddingModel(LlmModel):
             model.is_reranker = True
             from transformers import AutoModelForSequenceClassification
             origin_model = AutoModelForSequenceClassification.from_pretrained(pretrained_model_name_or_path, config=config, trust_remote_code=True).float().eval()
+            if args is not None and getattr(args, 'qat', False):
+                mark_qat_sources(origin_model, args)
             model.classifier = origin_model.classifier
             origin_model = origin_model.new
         else:
             origin_model = AutoModel.from_pretrained(pretrained_model_name_or_path, config=config, trust_remote_code=True).float().eval()
+            if args is not None and getattr(args, 'qat', False):
+                mark_qat_sources(origin_model, args)
 
         transformer = origin_model.encoder
         model.lm = origin_model.pooler
@@ -672,11 +728,15 @@ class EmbeddingModel(LlmModel):
             model_file = os.path.join(pretrained_model_name_or_path, 'model.safetensors')
             state_dict = load_file(model_file)
             missing, unexpected = original_model.load_state_dict(state_dict, strict=False)
+            if args is not None and getattr(args, 'qat', False):
+                unexpected = filter_qat_unexpected_keys(unexpected, state_dict, args)
             if missing or unexpected:
                 raise RuntimeError(f'Failed to load qwen3_vl embedding checkpoint correctly. missing={missing[:8]}, unexpected={unexpected[:8]}')
             original_model = original_model.eval()
 
         original_model = original_model.float()
+        if args is not None and getattr(args, 'qat', False):
+            mark_qat_sources(original_model, args)
         model = cls(config, args)
         ModelMapper.do_map(model, original_model, config.model_map['model'])
 
@@ -721,7 +781,10 @@ class EmbeddingModel(LlmModel):
         embeddings = inputs_embeds + position_embeddings + self.token_type_embeddings
         hidden_states = self.embedding_layernorm(embeddings)
         for i in range(self.config.num_hidden_layers):
-            hidden_states = self.blocks[i](hidden_states, attention_mask)[0]
+            layer_out = self.blocks[i](hidden_states, attention_mask)
+            # transformers>=5.0 BertLayer returns a plain tensor; older versions
+            # return a tuple whose first element is the hidden states.
+            hidden_states = layer_out[0] if isinstance(layer_out, (tuple, list)) else layer_out
         sentence_embeddings = hidden_states[:, 0]
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings

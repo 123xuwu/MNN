@@ -1,9 +1,10 @@
+from .package_writer import register_file_region
 import os
 import torch
 torch.set_printoptions(precision=4, sci_mode=False)
 from .model_mapper import ModelMapper
-from .transformers import Rotary, Decoder
-from .token2wav import Qwen2_5OmniToken2Wav, Qwen3TTSToken2Wav
+from .transformers import Rotary, Decoder, Lfm3OfflineBackbone
+from .token2wav import Qwen2_5OmniToken2Wav, Qwen3TTSToken2Wav, LiquidCodecDecoder
 from .spinner import spinner_run
 from .torch_utils import onnx_export
 from .custom_op import FakeLinear
@@ -69,7 +70,7 @@ class Talker(torch.nn.Module):
         embedding_file = f'{self.args.dst_path}/talker_embeddings_bf16.bin'
         with open(embedding_file, 'wb') as f:
             f.write(buffer)
-        return embedding_file
+        return register_file_region(self.args, embedding_file)
 
 class OmniRotary(Rotary):
     def __init__(self, model):
@@ -293,7 +294,7 @@ class Qwen2_5OmniTalker(Talker):
         return talker_onnx
 
 
-class Qwen3TTSCodePredictor(torch.nn.Module):
+class Qwen3TTSAudioCodePredictor(torch.nn.Module):
     def __init__(self, predictor, base):
         super().__init__()
         self.predictor = predictor.float()
@@ -330,7 +331,7 @@ class Qwen3TTSCodePredictor(torch.nn.Module):
         embedding_file = f'{self.args.dst_path}/code_predictor_embeddings_bf16.bin'
         with open(embedding_file, 'wb') as f:
             f.write(buffer)
-        return embedding_file
+        return register_file_region(self.args, embedding_file)
 
     def unload_param(self):
         self.unloaded_ops = {}
@@ -349,37 +350,44 @@ class Qwen3TTSCodePredictor(torch.nn.Module):
                     self.predictor.lm_head[i] = FakeLinear(
                         head.in_features, head.out_features, head.bias is not None, name)
 
-    def forward(self, talker_hidden_states, codec_embeds, attention_mask, position_ids):
-        hidden_states = torch.cat([talker_hidden_states.unsqueeze(1), codec_embeds], dim=1)
-        hidden_states = self.predictor.small_to_mtp_projection(hidden_states)
+    def forward(self, inputs_embeds, attention_mask, position_ids):
+        # inputs_embeds row 0 is the talker hidden state, rows 1.. are the codec
+        # embeddings of the codes generated so far -- the same sequence the old
+        # graph assembled via an internal concat. Building it in the caller lets
+        # a decode step append a single row through the KV cache instead of
+        # re-feeding the whole frame every call.
+        hidden_states = self.predictor.small_to_mtp_projection(inputs_embeds)
         rotary_pos_emb = self.rotary(position_ids)
         for i in range(self.num_hidden_layers):
             hidden_states = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask)
         hidden_states = self.predictor.model.norm(hidden_states)
+        # Every head reads the last row: at decode step g the last row is
+        # position g, exactly the row head g-1 was trained on (head i reads row
+        # i+1), so callers keep sampling the flat offset (g-1)*vocab.
         logits = []
         for i in range(self.config.num_code_groups - 1):
-            logits.append(self.predictor.lm_head[i](hidden_states[:, i + 1:i + 2, :]))
+            logits.append(self.predictor.lm_head[i](hidden_states[:, -1:, :]))
         return torch.cat(logits, dim=1)
 
-    @spinner_run(f'export qwen3_tts code predictor to ')
+    @spinner_run(f'export qwen3_tts audio_code_predictor to ')
     def export(self, onnx_path):
         self.export_embed()
         self.unload_param()
         seq_len = self.config.num_code_groups
-        talker_hidden_states = torch.randn([1, self.hidden_size])
-        codec_embeds = torch.randn([1, self.config.num_code_groups - 1, self.hidden_size])
+        inputs_embeds = torch.randn([1, seq_len, self.hidden_size])
         attention_mask = (1 - torch.tril(torch.ones([1, 1, seq_len, seq_len]))) * torch.finfo(torch.float32).min
         position_ids = torch.arange(seq_len, dtype=torch.int).unsqueeze(0)
-        code_predictor_onnx = f'{onnx_path}/code_predictor.onnx'
-        onnx_export(self, (talker_hidden_states, codec_embeds, attention_mask, position_ids),
-                    code_predictor_onnx,
-                    input_names=['talker_hidden_states', 'codec_embeds', 'attention_mask', 'position_ids'],
+        audio_code_predictor_onnx = f'{onnx_path}/code_predictor.onnx'
+        onnx_export(self, (inputs_embeds, attention_mask, position_ids),
+                    audio_code_predictor_onnx,
+                    input_names=['inputs_embeds', 'attention_mask', 'position_ids'],
                     output_names=['logits'],
                     dynamic_axes={
+                        'inputs_embeds': { 1: 'size' },
                         'attention_mask': { 2: 'size', 3: 'size' },
                         'position_ids': { 1: 'size' }
                     })
-        return code_predictor_onnx
+        return audio_code_predictor_onnx
 
 
 class Qwen3TTSPromptEmbedder(torch.nn.Module):
@@ -421,7 +429,7 @@ class Qwen3TTSPromptEmbedder(torch.nn.Module):
 
 
 class Qwen3TTSCodecEmbedder(torch.nn.Module):
-    def __init__(self, talker, code_predictor):
+    def __init__(self, talker, audio_code_predictor):
         super().__init__()
         self.talker = talker.float()
 
@@ -465,6 +473,7 @@ class Qwen3TTSTalker(Talker):
             'code_predictor_embedding_file': 'code_predictor_embeddings_bf16.bin',
             'code_predictor_vocab_size': self.talker.config.code_predictor_config.vocab_size,
             'code_predictor_groups': self.talker.config.code_predictor_config.num_code_groups,
+            'code_predictor_incremental': True,
             'speech_decoder_model': 'speech_decoder.mnn',
             'speech_decoder_weight': 'speech_decoder.mnn.weight',
             'speech_decoder_upsample_rate': 1920,
@@ -505,7 +514,7 @@ class Qwen3TTSTalker(Talker):
             decoder = Decoder(block, layer_id, self)
             decoder.self_attn.export_fused_attn = True
             self.blocks.append(decoder)
-        self.code_predictor = Qwen3TTSCodePredictor(self.talker.code_predictor, self)
+        self.audio_code_predictor = Qwen3TTSAudioCodePredictor(self.talker.code_predictor, self)
         self.prompt_embedder = Qwen3TTSPromptEmbedder(self.talker, self.config.origin_config)
         self.codec_embedder = Qwen3TTSCodecEmbedder(self.talker, self.talker.code_predictor)
         self.token2wav = Qwen3TTSToken2Wav(self)
@@ -519,7 +528,7 @@ class Qwen3TTSTalker(Talker):
         embedding_file = f'{self.args.dst_path}/talker_text_embeddings_bf16.bin'
         with open(embedding_file, 'wb') as f:
             f.write(buffer)
-        return embedding_file
+        return register_file_region(self.args, embedding_file)
 
     def unload_param(self):
         self.unloaded_ops = {}
@@ -586,5 +595,77 @@ class Qwen3TTSTalker(Talker):
                         "trailing_text_hidden": { 1: "trailing_len" },
                     })
         return [talker_onnx,
-                self.code_predictor.export(onnx_path),
+                self.audio_code_predictor.export(onnx_path),
                 self.codec_embedder.export(onnx_path)]
+
+
+class Lfm3DepthDecoder(torch.nn.Module):
+    def __init__(self, depth):
+        super().__init__()
+        self.projection = depth.depth_linear
+        self.mask_embedding = depth.mask_embedding
+        self.embeddings = depth.depth_embeddings
+        self.backbone = Lfm3OfflineBackbone(depth.model, causal=False)
+        self.num_codebooks, self.hidden_size = depth.num_codebooks, depth.hidden_size
+        self.heads = torch.nn.ModuleList()
+        for embedding in self.embeddings:
+            head = torch.nn.Linear(embedding.embedding.weight.shape[1], embedding.embedding.weight.shape[0], bias=False)
+            head.weight = embedding.embedding.weight
+            self.heads.append(head)
+
+    def forward(self, hidden_states, codes, masked):
+        embeds = torch.stack([embedding(codes[:, i]) for i, embedding in enumerate(self.embeddings)], dim=1)
+        hidden_states = self.projection(hidden_states).reshape(-1, self.num_codebooks, self.hidden_size)
+        hidden_states = hidden_states + torch.where(masked[:, :, None] > 0, self.mask_embedding, embeds)
+        hidden_states = self.backbone(hidden_states)
+        return torch.stack([head(embedding.embedding_norm(hidden_states[:, i]))
+                            for i, (embedding, head) in enumerate(zip(self.embeddings, self.heads))], dim=1)
+
+
+
+class Lfm3Speech(torch.nn.Module):
+    def __init__(self, model, path, generation_config):
+        super().__init__()
+        from transformers import AutoProcessor
+        self.config = model.config
+        self.generation_config = generation_config
+        self.depth = Lfm3DepthDecoder(model.depth_decoder.float())
+        self.codebook_embedding = model.codebook_embedding
+        codec = AutoProcessor.from_pretrained(path, trust_remote_code=True).audio_tokenizer.float().eval()
+        self.codec = LiquidCodecDecoder(codec)
+
+    def get_config(self):
+        keys = ('num_codebooks', 'codebook_size', 'audio_eos_code', 'maskgit_schedule',
+                'interleaved_n_text', 'interleaved_n_audio', 'audio_start_token_id',
+                'audio_out_token_id', 'mixed_start_token_id', 'text_end_token_id')
+        return {'lfm3_speech': {**{key: getattr(self.config, key) for key in keys},
+                               'sample_rate': 24000, 'n_fft': self.codec.n_fft, 'hop_length': self.codec.hop},
+                'hidden_states': True}
+
+    def get_generation_config(self):
+        config = {}
+        for key in ('audio_temperature', 'audio_top_k', 'audio_repetition_penalty', 'audio_repetition_window'):
+            value = getattr(self.generation_config, key, None)
+            # HF uses null for an unbounded top-k; MNN uses zero.
+            if key == 'audio_top_k' and value is None:
+                value = 0
+            if value is not None:
+                config[key] = value
+        # HF controls audio sampling independently of the text do_sample setting.
+        if not self.generation_config.do_sample:
+            config['sampler_type'] = 'greedy'
+        return config
+
+    def export(self, onnx_path):
+        from pathlib import Path
+        root = Path(onnx_path)
+        embedding = self.codebook_embedding.weight.detach().cpu().bfloat16().view(torch.int16)
+        (root.parent / 'audio_embeddings_bf16.bin').write_bytes(embedding.numpy().tobytes())
+        depth_path, codec_path = str(root / 'depth.onnx'), str(root / 'codec.onnx')
+        count = self.config.num_codebooks
+        onnx_export(self.depth, (torch.randn(1, self.config.text_config.hidden_size),
+                                torch.zeros(1, count, dtype=torch.int32), torch.ones(1, count, dtype=torch.int32)),
+                    depth_path, ['hidden_states', 'codes', 'masked'], ['logits'], {})
+        onnx_export(self.codec, (torch.zeros(1, count, 4, dtype=torch.int32),), codec_path,
+                    ['codes'], ['frames'], {'codes': {2: 'frames'}, 'frames': {1: 'stft_frames'}})
+        return [depth_path, codec_path]

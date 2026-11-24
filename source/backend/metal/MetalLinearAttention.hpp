@@ -23,6 +23,11 @@ namespace MNN {
 struct MetalStateCache {
     std::shared_ptr<Tensor> mConvState;      // Conv1D padding state: [B, D, kernel_size - 1]
     std::shared_ptr<Tensor> mRecurrentState; // Gated Delta Rule recurrent state S: [B, H, d_k, d_v]
+    // Prefix-cache file index captured once per session (previous == remove);
+    // chunks 2..N reuse it instead of re-advancing mMeta->layer_index, which
+    // would drift LA past Full Attention layers in hybrid models.
+    // Sentinel -1 = not captured.
+    int mPrefixLayerIndex = -1;
     // Pending verify block: the states above always hold the committed prefix only.
     std::shared_ptr<Tensor> mPendingQKVRaw;  // [B, D, cap] raw qkv (pre-conv) for conv-state commit
     std::shared_ptr<Tensor> mPendingK;       // [B, cap, H, d_k] prepped k
@@ -44,6 +49,7 @@ public:
     MetalLinearAttention(Backend* backend, const MNN::Op* op);
     virtual ~MetalLinearAttention() = default;
     virtual ErrorCode onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
+    virtual ErrorCode onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
     virtual void onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                           id<MTLComputeCommandEncoder> encoder) override;
     // Prefill encode performs per-token CPU state management (state reset
@@ -53,7 +59,8 @@ public:
     // encode whose shape it describes. A live pending block is excluded too: it may emit a flush.
     virtual bool canRecordEncode() const override {
         return mLastSeqLen == 1 && mAttentionType == "gated_delta_rule" &&
-               mStateCache->mPendingLen == 0;
+               mStateCache->mPendingLen == 0 &&
+               (mMeta == nullptr || mMeta->file_flag != KVMeta::PendingWrite);
     }
     // onResize re-creates mConvOut (and may re-plan the allocator), leaving
     // dangling Tensor* in recorded bindings. Bail out of replay whenever a
@@ -75,6 +82,7 @@ private:
     std::shared_ptr<MetalStateCache> mStateCache;
 
     KVMeta* mMeta = nullptr;
+    std::string mPrefixCacheDir;
 
     // Replay guards (see canRecordEncode/onReplayUpdate above)
     int mLastSeqLen = 0;
@@ -96,6 +104,11 @@ private:
     std::shared_ptr<Tensor> mQ;       // [B, L, H, d_k]
     std::shared_ptr<Tensor> mK;       // [B, L, H, d_k]
     std::shared_ptr<Tensor> mV;       // [B, L, H, d_v]
+    // chunk64 per-token scalars produced by prep and consumed by the serial scan:
+    // [B*H, 4, roundup(L, 64)] as {gate cumsum, beta, 1/|q|, 1/|k|}.  Declared
+    // int32 so fp16 precision does not halve the storage — the gate cumsum
+    // reaches -1920 within a chunk and needs fp32 exponent differences.
+    std::shared_ptr<Tensor> mChunkStats;
     // Param buffer for shader
     id<MTLBuffer> mParamBuffer;
     // Flushes a pending block outside the verify path: seq_len = 0 plus the commit fields.
@@ -103,6 +116,7 @@ private:
 
     // Pipeline states
     id<MTLComputePipelineState> mConvSiluPipeline;
+    id<MTLComputePipelineState> mConvSiluRow4Pipeline = nil;
     id<MTLComputePipelineState> mConvSiluStateDecodePipeline = nil;
     id<MTLComputePipelineState> mConvStateUpdatePipeline;
     id<MTLComputePipelineState> mQKVPrepPipeline;
@@ -110,6 +124,7 @@ private:
     id<MTLComputePipelineState> mGatedDeltaRulePipeline;
     id<MTLComputePipelineState> mGatedDeltaRuleSGPipeline;
     id<MTLComputePipelineState> mGatedDeltaRuleSGV4Pipeline = nil;
+    id<MTLComputePipelineState> mGatedDeltaRuleSGV2Pipeline = nil;
     id<MTLComputePipelineState> mGatedDeltaRuleFusedSGPipeline;
     id<MTLComputePipelineState> mFusedSGAlignPipeline     = nil;
     int mFusedSGAlignSimds = 4;

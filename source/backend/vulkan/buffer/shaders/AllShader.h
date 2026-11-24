@@ -1,5 +1,25 @@
 #ifndef VK_GLSL_SHADER_AUTO_GENERATE_H
 #define VK_GLSL_SHADER_AUTO_GENERATE_H
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern const unsigned char glsl_indexed_linear_route_comp[];
+extern unsigned int glsl_indexed_linear_route_comp_len;
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern const unsigned char glsl_indexed_linear_gemv_comp[];
+extern unsigned int glsl_indexed_linear_gemv_comp_len;
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern const unsigned char glsl_indexed_linear_gemv_FP16_comp[];
+extern unsigned int glsl_indexed_linear_gemv_FP16_comp_len;
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern const unsigned char glsl_indexed_linear_gemm_comp[];
+extern unsigned int glsl_indexed_linear_gemm_comp_len;
+#endif
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+extern const unsigned char glsl_indexed_linear_gemm_FP16_comp[];
+extern unsigned int glsl_indexed_linear_gemm_FP16_comp_len;
+#endif
 extern const unsigned char glsl_int3_weight_to_pack_comp[];
 extern unsigned int glsl_int3_weight_to_pack_comp_len;
 extern const unsigned char glsl_int3_weight_to_pack_FP16_comp[];
@@ -236,6 +256,10 @@ extern const unsigned char glsl_convolution_RELU6_FP16_comp[];
 extern unsigned int glsl_convolution_RELU6_FP16_comp_len;
 extern const unsigned char glsl_dynamic_w8a8_coop_gemm_comp[];
 extern unsigned int glsl_dynamic_w8a8_coop_gemm_comp_len;
+extern const unsigned char glsl_dynamic_w8a8_coop_gemm_fused_comp[];
+extern unsigned int glsl_dynamic_w8a8_coop_gemm_fused_comp_len;
+extern const unsigned char glsl_dynamic_w8a8_coop_gemm_fused_FP16_comp[];
+extern unsigned int glsl_dynamic_w8a8_coop_gemm_fused_FP16_comp_len;
 extern const unsigned char glsl_attention_prefill_kblock_qk_comp[];
 extern unsigned int glsl_attention_prefill_kblock_qk_comp_len;
 extern const unsigned char glsl_attention_prefill_kblock_qk_FP16_comp[];

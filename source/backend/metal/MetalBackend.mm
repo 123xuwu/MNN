@@ -11,6 +11,7 @@
 #import "backend/metal/MetalReplay.hpp"
 #define MNN_METAL
 #import <MNN/MNNSharedContext.h>
+#import <TargetConditionals.h>
 #define METAL_CONST_BUFFER_LIMIT 128
 #define METAL_SEPERATE_MAX_COUNT 2
 // overload of MTLGPUFamilyMetal3/MTLGPUFamilyMetal4 (not available in some environments)
@@ -21,6 +22,9 @@
 #if MNN_METAL_ENABLED
 #include <mutex>
 #include <chrono>
+#include <sched.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #import "backend/metal/MNNMetalContext.h"
 #import "core/Macro.h"
 #import "core/TensorUtils.hpp"
@@ -57,10 +61,8 @@ public:
         e.second += 1;
         mTotal   += ms;
     }
-    // Record one (start, end) sample in nanoseconds (GPU clock, tick-scaled).
-    // Only accumulated when MNN_METAL_OP_PROFILE_TIMELINE=<path> is set; the
-    // aggregate table is unaffected either way. The timeline is dumped to the
-    // given path (CSV) at process exit so a gantt chart can be built off it.
+    // Per-op (start, end) sample in GPU-clock ns, dumped to CSV at exit when
+    // MNN_METAL_OP_PROFILE_TIMELINE is set.
     void addSample(const std::string& name, double t0_ns, double t1_ns) {
         if (!timelineEnabled()) return;
         std::lock_guard<std::mutex> _l(mMutex);
@@ -86,16 +88,18 @@ public:
                          const std::pair<std::string, std::pair<double, int>>& b) {
                           return a.second.first > b.second.first;
                       });
-            printf("\n===== Metal Per-Op GPU Time Profile =====\n");
-            printf("%-22s %12s %10s %12s %8s\n", "OpType", "GPU(ms)", "Calls", "Avg(us)", "Ratio");
+            // MNN_PRINT, not printf: on iOS stdout is not attached to the
+            // console the way devicectl captures it, so printf output is lost.
+            MNN_PRINT("\n===== Metal Per-Op GPU Time Profile =====\n");
+            MNN_PRINT("%-46s %12s %10s %12s %8s\n", "OpType", "GPU(ms)", "Calls", "Avg(us)", "Ratio");
             for (auto& it : items) {
                 double t = it.second.first;
                 int    c = it.second.second;
-                printf("%-22s %12.3f %10d %12.3f %7.2f%%\n", it.first.c_str(), t, c,
-                       c > 0 ? t * 1000.0 / c : 0.0, mTotal > 0 ? t / mTotal * 100.0 : 0.0);
+                MNN_PRINT("%-46s %12.3f %10d %12.3f %7.2f%%\n", it.first.c_str(), t, c,
+                          c > 0 ? t * 1000.0 / c : 0.0, mTotal > 0 ? t / mTotal * 100.0 : 0.0);
             }
-            printf("%-22s %12.3f\n", "TOTAL", mTotal);
-            printf("=========================================\n");
+            MNN_PRINT("%-46s %12.3f\n", "TOTAL", mTotal);
+            MNN_PRINT("=========================================\n");
             mStat.clear();
             mTotal = 0;
         }
@@ -116,10 +120,10 @@ public:
                             (e.t1_ns - e.t0_ns) / 1000.0, e.name.c_str());
                 }
                 fclose(fp);
-                printf("[MetalOpProfiler] timeline dumped: %s (%zu samples)\n",
-                       csvPath, mTimeline.size());
+                MNN_PRINT("[MetalOpProfiler] timeline dumped: %s (%zu samples)\n",
+                          csvPath, mTimeline.size());
             } else {
-                printf("[MetalOpProfiler] failed to open timeline path: %s\n", csvPath);
+                MNN_PRINT("[MetalOpProfiler] failed to open timeline path: %s\n", csvPath);
             }
             mTimeline.clear();
         }
@@ -191,6 +195,17 @@ static constexpr int kProfileSampleBufferCapacity = 1024;  // 512 encoders per c
 
 namespace MNN {
 
+#if MNN_METAL_OP_PROFILE
+// Flushes the profiler's aggregate table and timeline CSV on demand, for hosts that
+// kill the process instead of returning from main and so never run its destructor.
+// Idempotent (print() clears the accumulators).
+void MetalOpProfileFlush() {
+    gMetalOpProfiler.print();
+}
+#else
+void MetalOpProfileFlush() {}
+#endif
+
 static void _MetalApplyTensor(uint8_t* host, size_t offset, Tensor* t) {
     // ptr of MetalBufferAlloc
     t->buffer().device = (uint64_t)host;
@@ -237,7 +252,8 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
     mRuntime = runtime;
     auto ctx = (__bridge MNNMetalContext *)runtime->context();
     mBufferPool.reset(runtime->createDynamicAllocator(0, false));
-    mExecutionBufferPool.reset(new EagerBufferAllocator(runtime->buffer(0)->root, 1024));
+    // Execution-time frees end real lifetimes, so whole free blocks can be reclaimed here.
+    mExecutionBufferPool.reset(new EagerBufferAllocator(runtime->buffer(0)->root, 1024, 0, true));
     mCurrentAllocator = mBufferPool.get();
     mUseFloatAsFp16 = usefp16AsFp32;
     mMemoryMode = mode;
@@ -279,14 +295,10 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
         }
     }
 #endif
-    if(((MetalRuntime *)mRuntime)->supportTensorOps()) {
+    if(((MetalRuntime *)mRuntime)->useTensorOps()) {
         mSupportTensorApi = true;
-        // Probe every matmul2d descriptor shape actually used by MNN kernels
-        // (attention 32x32x32, conv 32x64x64 / 32x64x32 / 64x64x32, plus the
-        // dynamic-K device-tensor form). If a future MPP header rejects any of
-        // them, the probe fails and the tensor api is disabled as a whole,
-        // instead of passing a toy shape and then failing kernel compilation
-        // at runtime on every dispatch.
+        // Probe every matmul2d shape MNN kernels use so a header that rejects
+        // one disables the tensor API here instead of failing per dispatch.
         const char * src_tensor_f16 = "\n"
             "#include <metal_stdlib> \n"
             "#include <metal_tensor> \n"
@@ -347,15 +359,8 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
         }
     }
     if (mSupportTensorApi) {
-        // Separate probe for matmul2d INPUT cooperative tensors. Fused attention
-        // needs the QK destination to become the PV left operand in registers,
-        // which requires input cooperative tensors -- and those are only allowed
-        // at single-simdgroup scope (MPPTensorOpsMatMul2dImpl.h: "Input
-        // cooperative tensors require a single SIMD group"). None of MNN's other
-        // tensor kernels use this, so it gets its own capability flag.
-        // Covers all three shapes the fused kernel needs: QK (B transposed),
-        // PV (neither transposed), and PV with an fp32 left operand (the
-        // softmax output is kept in fp32).
+        // Separate probe for matmul2d input cooperative tensors (needed by
+        // fused attention to keep QK destination as the PV left operand).
         const char* src_coop_input = "\n"
             "#include <metal_stdlib> \n"
             "#include <metal_tensor> \n"
@@ -370,7 +375,8 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
             "             metal::execution_simdgroup> mm; \n"
             "    auto ct_a = mm.template get_left_input_cooperative_tensor<AT, half, float>(); \n"
             "    auto ct_b = mm.template get_right_input_cooperative_tensor<AT, half, float>(); \n"
-            "    auto ct_c = mm.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>(); \n"
+            "    auto ct_c = mm.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ct_a)>, \n"
+            "             metal::remove_addrspace_t<decltype(ct_b)>, float>(); \n"
             "    for (ushort i = 0; i < 8; i++) { ct_a[i] = AT(seed); } \n"
             "    for (ushort i = 0; i < 16; i++) { ct_b[i] = half(seed); ct_c[i] = 0.0f; } \n"
             "    mm.run(ct_a, ct_b, ct_c); \n"
@@ -397,6 +403,9 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
 }
 MetalBackend::~MetalBackend() {
     flushEncoder();
+    // Pool chunks return to the runtime allocator here; wait so the next
+    // backend's acquire never reuses memory still being written.
+    waitOwnInflight();
     removeNotificationsObservers();
 }
 
@@ -485,6 +494,13 @@ public:
         mBuffer = buffer;
         mAllocator = allocator;
     }
+    MetalMemRelease(MemChunk buffer, std::shared_ptr<BufferAllocator> allocator) {
+        mBuffer = buffer;
+        mAllocator = allocator.get();
+        // Keep runtime-owned static allocator alive: STATIC mem objects can outlive
+        // the MetalRuntime when user code still holds output VARPs after releasing the module.
+        mHoldAllocator = std::move(allocator);
+    }
     virtual ~ MetalMemRelease() {
         mAllocator->free(mBuffer);
     }
@@ -494,6 +510,7 @@ public:
 private:
     MemChunk mBuffer;
     BufferAllocator* mAllocator;
+    std::shared_ptr<BufferAllocator> mHoldAllocator;
 };
 size_t MetalBackend::getTensorSizeInBytes(const Tensor* tensor) const {
     auto format = TensorUtils::getDescribe(tensor)->dimensionFormat;
@@ -539,6 +556,21 @@ size_t MetalBackend::getTensorSizeInBytes(const Tensor* tensor) const {
     return size;
 }
 
+void MetalBackend::aliasTensor(const Tensor* tensor, const Tensor* owner, size_t byteOffset) {
+    auto des = TensorUtils::getDescribeOrigin(tensor);
+    // Hand the tensor's own region back before re-pointing, so the pool can reuse
+    // it; nothing reads through this tensor's old address afterwards.
+    des->mem = nullptr;
+    _MetalApplyTensor((uint8_t*)owner->buffer().device,
+                      TensorUtils::getDescribeOrigin(owner)->offset + byteOffset,
+                      const_cast<Tensor*>(tensor));
+}
+
+bool MetalBackend::onCanShareBuffer(const Tensor* source, const Tensor* view) const {
+    return TensorUtils::isBufferLayoutCompatible(source, view, 4) &&
+        getTensorSizeInBytes(source) >= getTensorSizeInBytes(view);
+}
+
 Backend::MemObj* MetalBackend::onAcquire(const Tensor *_tensor, StorageType storageType) {
     auto tensor  = const_cast<Tensor *>(_tensor);
     size_t size = getTensorSizeInBytes(_tensor);
@@ -548,14 +580,16 @@ Backend::MemObj* MetalBackend::onAcquire(const Tensor *_tensor, StorageType stor
     // reuse if possible
     MemChunk buffer;
     BufferAllocator* allocator = nullptr;
+    std::shared_ptr<BufferAllocator> holdAllocator;
     switch (storageType) {
         case Backend::STATIC: {
-            buffer = mRuntime->mStaticAllocator->alloc(size, false);
-            allocator = mRuntime->mStaticAllocator.get();
+            holdAllocator = mRuntime->mStaticAllocator;
+            buffer = holdAllocator->alloc(size, false);
             if (nullptr == buffer.first && nullptr != mRuntime->mStaticAllocatorRaw.get()) {
-                buffer = mRuntime->mStaticAllocatorRaw->alloc(size, false);
-                allocator = mRuntime->mStaticAllocatorRaw.get();
+                holdAllocator = mRuntime->mStaticAllocatorRaw;
+                buffer = holdAllocator->alloc(size, false);
             }
+            allocator = holdAllocator.get();
         } break;
         case Backend::DYNAMIC: {
             buffer = mCurrentAllocator->alloc(size, false);
@@ -586,10 +620,16 @@ Backend::MemObj* MetalBackend::onAcquire(const Tensor *_tensor, StorageType stor
     } else {
         _MetalApplyTensor((uint8_t*)buffer.first, buffer.second, (Tensor*)_tensor);
     }
+    if (nullptr != holdAllocator) {
+        return new MetalMemRelease(buffer, holdAllocator);
+    }
     return new MetalMemRelease(buffer, allocator);
 }
 
 bool MetalBackend::onClearBuffer() {
+    // Same release-side hazard as the destructor: release(true) returns chunks
+    // to the runtime-wide allocator, so our own GPU writes must have landed.
+    waitOwnInflight();
     mCurrentAllocator->release(true);
     if (mExecutionBufferPool.get() != nullptr) {
         mExecutionBufferPool->release(true);
@@ -604,6 +644,10 @@ bool MetalBackend::onClearBuffer() {
 
 Execution *MetalBackend::onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                   const Op *op) {
+    // Execution constructors (weight load + transform encodes) create
+    // autoreleased command buffers/encoders; drain them per creation so a
+    // caller without a runloop drain doesn't accumulate the bound MTLBuffers.
+    @autoreleasepool {
     auto map  = getCreatorMap();
 
     auto iter = map->find(op->type());
@@ -626,6 +670,7 @@ Execution *MetalBackend::onCreate(const std::vector<Tensor *> &inputs, const std
     profileRegisterOp(exe, EnumNameOpType(op->type()));
 #endif
     return exe;
+    }
 }
 void MetalBackend::flushEncoder() const {
     if (nil != mComputeEncoder) {
@@ -701,10 +746,29 @@ void MetalBackend::_resetDynamicMemory() const {
 void MetalBackend::onExecuteBegin() const {
     _resetDynamicMemory();
     mEncoderCount = 0;
+    // Boost caller thread to user-interactive for encode/commit so it is not
+    // parked on efficiency cores; restored in onExecuteEnd, no-op if already
+    // boosted or on dispatch-managed threads.
+    mQosBoosted = false;
+    if (MetalEnv::get().qosBoost) {
+        qos_class_t prevClass = QOS_CLASS_UNSPECIFIED;
+        int prevRelPri = 0;
+        if (pthread_get_qos_class_np(pthread_self(), &prevClass, &prevRelPri) == 0 &&
+            prevClass < QOS_CLASS_USER_INTERACTIVE &&
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0) {
+            mQosBoosted = true;
+            mQosPrevClass = (unsigned int)prevClass;
+            mQosPrevRelPri = prevRelPri;
+        }
+    }
 }
 void MetalBackend::onExecuteEnd() const {
     flushEncoder();
     commit_net();
+    if (mQosBoosted) {
+        pthread_set_qos_class_self_np((qos_class_t)mQosPrevClass, mQosPrevRelPri);
+        mQosBoosted = false;
+    }
 }
     
 BufferAllocator* MetalBackend::getBufferPool() const {
@@ -744,20 +808,18 @@ bool MetalBackend::onGetTensorInfo(const Tensor* tensor, void* dstInfo) {
 
 bool MetalBackend::isCmdBufferCommit() {
 #if MNN_METAL_OP_PROFILE
-    // Legacy profiling: commit one command buffer per op so that each command
-    // buffer's GPUEndTime-GPUStartTime measures a single op's GPU time.
-    // Counter mode times per-encoder via MTLCounterSampleBuffer and keeps the
-    // normal commit cadence (accurate absolute numbers, low overhead).
+    // Legacy profiling commits per op so each buffer's GPU time maps to one
+    // op; counter mode uses MTLCounterSampleBuffer and keeps the normal cadence.
     if (!mProfileCounterMode) {
         return true;
     }
 #endif
     auto ctx = (__bridge MNNMetalContext *)context();
-    
-    //TODO: set magic number
-    // Experiment: MNN_METAL_COMMIT_NUM overrides ops-per-commit cadence
-    const int sEnvCommitNum = MetalEnv::get().commitNum;
-    const int magicNum = sEnvCommitNum > 0 ? sEnvCommitNum : mRuntime->hint().encorderNumForCommit;
+
+    constexpr int kMetalCommitNum = 30;
+    const auto& hint = mRuntime->hint();
+    const int magicNum =
+        hint.encorderNumForCommit >= 0 ? hint.encorderNumForCommit : kMetalCommitNum;
     mEncoderCount++;
     if(mEncoderCount != 0 && mEncoderCount % magicNum == 0) {
         return true;
@@ -833,6 +895,8 @@ id<MTLBuffer> MetalBackend::getConstBuffer(size_t size) const {
     auto buffer  = [context newDeviceBuffer:size access:CPUReadWrite];
     return buffer;
 }
+// No in-flight tracking: a returned buffer may be reused immediately, so only
+// return when our GPU work is drained (op dtor, or onResizeBegin's fence).
 void MetalBackend::returnConstBuffer(id<MTLBuffer> buffer) const {
     mHoldBuffers.push(buffer);
 }
@@ -1018,21 +1082,23 @@ void MetalBackend::onResizeBegin() {
     // Abort last inference task if needed
     flushEncoder();
     _commandBuffer = nil;
-    // Per-backend fence (default): before resetting OUR allocator we only need
-    // OUR OWN in-flight GPU work to finish. The legacy wait() drained the
-    // runtime's last commit — which for LLM decode belongs to another module's
-    // backend (the per-token logits-slice submodule resize was draining the
-    // whole main graph, serializing CPU resize against GPU and costing ~14%
-    // decode on Qwen3-0.6B/M4 Pro). Note the legacy wait was not a true
-    // cross-queue drain either: backends own separate queues and _waiting only
-    // tracks the latest commit.
-    //   MNN_METAL_RESIZE_WAIT=global  -> legacy behavior (rollback/A-B)
-    //   MNN_METAL_RESIZE_WAIT=none    -> skip both fences (experiment only)
+    // Fence our own in-flight work before resetting our allocator.
+    //   MNN_METAL_RESIZE_WAIT=global -> drain the runtime's latest commit
+    //   MNN_METAL_RESIZE_WAIT=none   -> skip both fences (experiment only)
     const int sResizeWaitMode = MetalEnv::get().resizeWaitMode;
     if (sResizeWaitMode == 1) {
         wait(0);
     } else if (sResizeWaitMode == 0) {
         waitOwnInflight();
+    } else {
+        // No fence: resize-time writes to persistent shared buffers can race
+        // with the still-running previous command buffer; warn once.
+        static bool sWarned = false;
+        if (!sWarned) {
+            sWarned = true;
+            MNN_ERROR("[METAL] MNN_METAL_RESIZE_WAIT=none: resize fence disabled, "
+                      "op params may be overwritten while still in flight. Experiment only.\n");
+        }
     }
     mCurrentAllocator->reset();
     // Clear Gate/Up fusion mappings from previous resize
@@ -1045,34 +1111,25 @@ ErrorCode MetalBackend::onResizeEnd() {
     if (err != NO_ERROR) {
         return err;
     }
-    // Export-time fused projections wire up their own leader/follower dispatch
-    // from the exported member order. Must run after compute(): the setup
-    // re-homes follower outputs to STATIC, which only sticks once the dynamic
-    // allocator has assigned addresses.
+    // Before setupFusion: the gate fold re-homes raw a/b, which the fused
+    // linear_in group then bakes into its single dispatch.
+    err = applyLinearAttnGateFolds();
+    if (err != NO_ERROR) {
+        return err;
+    }
+    // Export-time fused projections wire up leader/follower from the exported
+    // order; must run after compute() so the STATIC re-home sticks.
     for (auto* host : mFusedProjs) {
         host->setupFusion();
     }
-    return applyLinearAttnGateFolds();
+    return NO_ERROR;
 }
 
 ErrorCode MetalBackend::applyLinearAttnGateFolds() {
-    // The gate/beta fold is declared by the exported LinearAttentionParam
-    // (gate_fold): rawA/rawB are the op's own inputs and the per-head constants
-    // come from the param, so there is nothing to match here. All that remains
-    // is the STATIC re-home, and it must happen here rather than in the op's
-    // onResize: the pipeline's resize sweep nulls a consumer's input memory when
-    // its useCount exhausts (Pipeline.cpp _releaseTensor), which would free a
-    // STATIC home acquired earlier in the sweep before encode runs.
-    //
-    // Failure here is fatal rather than a fallback: the exporter already removed
-    // the gate chain from the graph, so an unfolded dispatch would consume the
-    // raw `a` projection as the decay gate.
-    // Re-home on EVERY resize, like MetalFusedProj::setupFusion does. The resize
-    // sweep drops the previous home unconditionally: _releaseTensor nulls `mem`
-    // whatever its storage type was (Pipeline.cpp), and _allocTensor then
-    // re-acquires DYNAMIC. Latching on a "already folded" flag would leave the
-    // raw a/b inputs back in the reusable pool from the second resize onwards,
-    // while the fold stays active -- and LLM decode re-resizes every token.
+    // STATIC re-home of rawA/rawB for the exported gate/beta fold. Must run
+    // here (not in op onResize) and on every resize: the pipeline sweep frees
+    // any home acquired earlier, regardless of storage type. Failure is fatal
+    // because the exporter already removed the gate chain.
     for (auto* req : mLinearAttnFolds) {
         if (!req->exportFold) {
             continue;
@@ -1081,12 +1138,18 @@ ErrorCode MetalBackend::applyLinearAttnGateFolds() {
             MNN_ERROR("MetalBackend: incomplete LinearAttention gate fold request\n");
             return NOT_SUPPORT;
         }
-        if (!onAcquireBuffer(req->rawA, Backend::STATIC)) {
+        // An identity-aliased raster output borrows its origin's chunk; re-homing
+        // would sever it from the content the raster never copied.
+        bool rawAAliased = TensorUtils::getDescribe(req->rawA)->storageRoot != nullptr;
+        bool rawBAliased = TensorUtils::getDescribe(req->rawB)->storageRoot != nullptr;
+        if (!rawAAliased && !onAcquireBuffer(req->rawA, Backend::STATIC)) {
             MNN_ERROR("MetalBackend: cannot re-home LinearAttention gate fold input\n");
             return OUT_OF_MEMORY;
         }
-        if (!onAcquireBuffer(req->rawB, Backend::STATIC)) {
-            onReleaseBuffer(req->rawA, Backend::STATIC);
+        if (!rawBAliased && !onAcquireBuffer(req->rawB, Backend::STATIC)) {
+            if (!rawAAliased) {
+                onReleaseBuffer(req->rawA, Backend::STATIC);
+            }
             MNN_ERROR("MetalBackend: cannot re-home LinearAttention beta fold input\n");
             return OUT_OF_MEMORY;
         }
@@ -1096,10 +1159,8 @@ ErrorCode MetalBackend::applyLinearAttnGateFolds() {
     return NO_ERROR;
 }
 
-// Byte span of a tensor inside its backing MTLBuffer. The span must be the
-// ALLOCATED size, not elementSize() * type.bytes(): getTensorSizeInBytes pads
-// NC4HW4 channels to 4 and adds extraPadding, and halves float32 under fp16
-// mode. Under-reporting here silently turns a real alias into "no overlap".
+// Byte span of a tensor in its MTLBuffer. Must use the allocated size (not
+// elementSize*type.bytes), else real aliases silently look non-overlapping.
 static bool _tensorSpan(const MetalBackend* backend, const Tensor* t, void*& buf, size_t& begin, size_t& end) {
     if (t == nullptr || t->deviceId() == 0) return false;
     auto alloc = (MetalRuntimeAllocator::MetalBufferAlloc *)t->deviceId();
@@ -1272,12 +1333,16 @@ void MetalBackend::onCopyDeviceToDevice(const Tensor *src, const Tensor *dst,
 }
 
 void MetalBackend::onCopyBuffer(const Tensor *src, const Tensor *dst) const {
+    // Public copy entry (constant uploads, wrap copies, h2d/d2h): creates
+    // autoreleased command buffers/encoders, so give it its own pool drain.
+    @autoreleasepool {
     flushEncoder();
     auto ctx = (__bridge MNNMetalContext *)context();
     commit_net();
     
     _resetDynamicMemory();
     onCopyBuffer(src, dst, nil, nil);
+    }
 }
 
 id<MTLComputeCommandEncoder> MetalBackend::encoder_for_net() const {
@@ -1325,11 +1390,8 @@ void MetalBackend::onCopyBuffer(const Tensor *src, const Tensor *dst, id<MTLComp
         return;
     }
     if (src->buffer().host && !dst->buffer().host) {
-        // Queued upload (default): stage the host bytes into a ring slot and
-        // encode the staging->dst copy on the command queue. Queue order makes
-        // it safe against in-flight GPU readers of dst from the previous
-        // forward, so the full pre-upload drain (wait) is no longer needed —
-        // that drain serialized CPU against GPU once per decode token.
+        // Default: stage host bytes into a ring slot and encode the copy on
+        // the queue; queue order protects in-flight readers of dst.
         // MNN_METAL_H2D_QUEUED=0 restores the legacy drain+direct-write path.
         const bool sH2DQueued = MetalEnv::get().h2dQueued;
         auto srcSize = src->usize();
@@ -1385,6 +1447,11 @@ void MetalBackend::onCopyBuffer(const Tensor *src, const Tensor *dst, id<MTLComp
     MNN_ASSERT(false); // should not be handled here
 }
 int MetalBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTensor) {
+    // Refuse reads after a failed command buffer: its writes were lost, so
+    // device memory no longer matches the recorded graph.
+    if (mRuntime->mCommandBufferFailed) {
+        return NO_EXECUTION;
+    }
     if (mRuntime->pExecutionStatus == NO_EXECUTION) {
 #ifdef CHECK_IOS_UI_STATUS
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
@@ -1406,13 +1473,24 @@ int MetalBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTen
     if (toCpu) {
         wait(3);
     }
+    // The wait above may have surfaced a command buffer error; fail this read
+    // rather than letting the caller consume the lost writes.
+    if (mRuntime->mCommandBufferFailed) {
+        return NO_EXECUTION;
+    }
     return 0;
 }
 id<MTLCommandBuffer> MetalBackend::getCommandBufferForBufferCopy() const {
     if (nil == _commandBuffer) {
         _commandBuffer = [_commandQueue commandBuffer];
+        mWaitForCompletedHandlers = false;
     }
     return _commandBuffer;
+}
+void MetalBackend::addCompletedHandler(MTLCommandBufferHandler handler) const {
+    auto buffer = getCommandBufferForBufferCopy();
+    mWaitForCompletedHandlers = true;
+    [buffer addCompletedHandler:handler];
 }
 id<MTLCommandBuffer> MetalBackend::getCommandBufferForNet() const {
     return getCommandBufferForBufferCopy();
@@ -1531,6 +1609,14 @@ void MetalBackend::commit() const {
         }];
 #endif
         [_commandBuffer commit];
+        if (mWaitForCompletedHandlers) {
+            // Completed status alone does not join the prefix-save handlers or protect their live state reads.
+            [_commandBuffer waitUntilCompleted];
+            if (_commandBuffer.error) {
+                MNN_ERROR("[METAL] command buffer error: %s\n", _commandBuffer.error.localizedDescription.UTF8String);
+                mRuntime->mCommandBufferFailed = true;
+            }
+        }
         mRuntime->_waiting = _commandBuffer;
         mLastOwnCommandBuffer = _commandBuffer;
         _commandBuffer = nil;
@@ -1541,6 +1627,10 @@ void MetalBackend::waitOwnInflight() const {
     if (nil != mLastOwnCommandBuffer) {
         if (mLastOwnCommandBuffer.status < MTLCommandBufferStatusCompleted) {
             [mLastOwnCommandBuffer waitUntilCompleted];
+        }
+        if (mLastOwnCommandBuffer.error) {
+            MNN_ERROR("[METAL] command buffer error: %s\n", mLastOwnCommandBuffer.error.localizedDescription.UTF8String);
+            mRuntime->mCommandBufferFailed = true;
         }
         mLastOwnCommandBuffer = nil;
     }
@@ -1556,6 +1646,42 @@ void MetalBackend::wait(int traceSite) const {
         if (buffer.status >= MTLCommandBufferStatusCompleted) {
             if (buffer.error) {
                 MNN_ERROR("[METAL] command buffer error: %s\n", buffer.error.localizedDescription.UTF8String);
+                mRuntime->mCommandBufferFailed = true;
+            }
+            mRuntime->_waiting = nil;
+            return;
+        }
+        if (MetalEnv::get().spinWait) {
+            // Poll buffer.status instead of waitUntilCompleted: the blocking wait's
+            // completion-handler wake is expensive next to one decode token. Spin with
+            // sched_yield, then fall back to the blocking wait past ~20ms.
+#ifdef MNN_SESSION_CPU_TRACE
+            auto t0 = std::chrono::steady_clock::now();
+#endif
+            auto spinStart = std::chrono::steady_clock::now();
+            int spins = 0;
+            while (buffer.status < MTLCommandBufferStatusCompleted) {
+                sched_yield();
+                if ((++spins & 0xFFF) == 0) {
+                    auto dt = std::chrono::steady_clock::now() - spinStart;
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(dt).count() > 20) {
+                        [buffer waitUntilCompleted];
+                        break;
+                    }
+                }
+            }
+#ifdef MNN_SESSION_CPU_TRACE
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            metalCpuTrace().waitNs += ns;
+            metalCpuTrace().waitCalls += 1;
+            if (traceSite >= 0 && traceSite < 4) {
+                metalCpuTrace().waitSiteNs[traceSite] += ns;
+                metalCpuTrace().waitSiteCalls[traceSite] += 1;
+            }
+#endif
+            if (buffer.error) {
+                MNN_ERROR("[METAL] command buffer error: %s\n", buffer.error.localizedDescription.UTF8String);
+                mRuntime->mCommandBufferFailed = true;
             }
             mRuntime->_waiting = nil;
             return;
@@ -1592,6 +1718,7 @@ void MetalBackend::wait(int traceSite) const {
 
         if (buffer.error) {
             MNN_ERROR("[METAL] command buffer error: %s\n", buffer.error.localizedDescription.UTF8String);
+            mRuntime->mCommandBufferFailed = true;
         }
     }
     mRuntime->_waiting = nil;
@@ -1605,6 +1732,14 @@ id<MTLComputePipelineState> MetalBackend::makeComputePipelineWithSourceOption(co
     if (nil == pipeline) {
         mRuntime->pCurrentStatus = NOT_SUPPORT;
         MNN_ERROR("pipelineWithSourceOption error.\n");
+    } else if (MetalEnv::get().pipelineInfo) {
+        MNN_PRINT("[PipelineInfo] %s maxThreads=%lu execWidth=%lu smem=%lu macros=%s\n", cname,
+                  (unsigned long)pipeline.maxTotalThreadsPerThreadgroup,
+                  (unsigned long)pipeline.threadExecutionWidth,
+                  (unsigned long)pipeline.staticThreadgroupMemoryLength,
+                  options == nil ? "-" : [[options.preprocessorMacros description]
+                                             stringByReplacingOccurrencesOfString:@"\n"
+                                                                       withString:@" "].UTF8String);
     }
     return pipeline;
 }
@@ -1684,6 +1819,7 @@ struct MetalContext {
     std::mutex pLock;
     MNNMetalContext* pContext;
     id<MTLDevice> pDevice;
+    size_t runtimeCount = 0;
 };
 static MetalContext* gContext = nullptr;
 MetalRuntime* MetalRuntime::create(const Backend::Info& info) {
@@ -1711,6 +1847,7 @@ MetalRuntime* MetalRuntime::create(const Backend::Info& info) {
     }
     auto mContext = (__bridge_retained void *)(gContext->pContext);
     auto rt = new MetalRuntime(mContext);
+    ++gContext->runtimeCount;
     rt->setGpuMode(info.gpuMode);
     if (nil != sharedContext.queue) {
         rt->setCommandQueue(sharedContext.queue, true);
@@ -1726,66 +1863,55 @@ MetalRuntime* MetalRuntime::create(const Backend::Info& info) {
     return rt;
 }
 
+// The family API cannot tell GPU generations or die tiers apart, so they come from
+// architecture.name. Neither separates M- from A-chips, hence device.name.
+static MetalGpuInfo parseGpuInfo(id<MTLDevice> device) {
+    MetalGpuInfo info;
+    if (@available(iOS 17.0, macOS 14.0, *)) {
+        const char* archName = [[[device architecture] name] UTF8String];
+        const char* kPrefix = "applegpu_g";
+        if (archName != nullptr && strncmp(archName, kPrefix, strlen(kPrefix)) == 0) {
+            info.gen = atoi(archName + strlen(kPrefix));
+            switch (archName[strlen(archName) - 1]) {
+                case 'p': info.tier = MetalGpuInfo::TierPhone; break;
+                case 'g': info.tier = MetalGpuInfo::TierBase; break;
+                case 's': info.tier = MetalGpuInfo::TierPro; break;
+                case 'c': info.tier = MetalGpuInfo::TierMax; break;
+                case 'd': info.tier = MetalGpuInfo::TierUltra; break;
+                default: break;
+            }
+        }
+    }
+    info.aSeries = [[device name] hasPrefix:@"Apple A"];
+    return info;
+}
+
 MetalRuntime::MetalRuntime(void* context) {
     mContext = context;
     auto ctx = (__bridge MNNMetalContext *)mContext;
     std::shared_ptr<EagerBufferAllocator::Allocator> allocator(new MetalRuntimeAllocator([ctx device]));
+    mMaxThreadSize = [[ctx device] maxThreadsPerThreadgroup].width;
+
+    // ---- Layer 1: software capability (OS + Metal stack on this chip) ----
     // supportsFamily: is available since iOS 13.0 / macOS 10.15, must check before calling
     if (@available(iOS 13.0, macOS 10.15, *)) {
         mSimdGroupReduce = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
         mSimdGroupReduce |= [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal3_MNN];
         mSimdGroupMatrix = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
-    } else {
-        mSimdGroupReduce = false;
-        mSimdGroupMatrix = false;
-    }
-    mMaxThreadSize = [[ctx device] maxThreadsPerThreadgroup].width;
-    // Metal4 Support M1/A14 and later chips
 #ifdef MNN_METAL_TENSOR
-    if (@available(iOS 13.0, macOS 10.15, *)) {
-        mTensorOps = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
-    } else {
-        mTensorOps = false;
+        // An OS-side term: true on any chip the Metal 4 stack serves, whether or not it
+        // has tensor hardware.
+        mMetal4TensorApi = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
+#endif
     }
 
-    // AI TensorCore device support from M5/A19
-    bool noAICoreDevice = [[[ctx device] name] containsString:@"M1"] || \
-                        [[[ctx device] name] containsString:@"M2"] || \
-                        [[[ctx device] name] containsString:@"M3"] || \
-                        [[[ctx device] name] containsString:@"M4"] || \
-                        [[[ctx device] name] containsString:@"A14"] || \
-                        [[[ctx device] name] containsString:@"A15"] || \
-                        [[[ctx device] name] containsString:@"A16"] || \
-                        [[[ctx device] name] containsString:@"A17"] || \
-                        [[[ctx device] name] containsString:@"A18"];
-    mTensorOps = mTensorOps && !noAICoreDevice;
-#else
-    mTensorOps = false;
-#endif
-    // M4-class capability gate (device-name based: M3 and M4 share MTLGPUFamilyApple9).
-    // Used for heuristics only calibrated on M4/A-series; M1/M2/M3 keep legacy routes.
-    bool isOldMacGpu = [[[ctx device] name] containsString:@"M1"] || \
-                       [[[ctx device] name] containsString:@"M2"] || \
-                       [[[ctx device] name] containsString:@"M3"];
-    mPreferInShaderPrefillDequant = mSimdGroupMatrix && !isOldMacGpu;
-    // M64 outer-dequant GEMM tile tier, MLX-style arch parse (family API can't
-    // tell M3 from M4 -- both MTLGPUFamilyApple9). architecture.name is
-    // "applegpu_g<gen><size>" (g13=M1 .. g16=M4/A18, size: p=phone, g=base/pro,
-    // s=max, d=ultra). M4-class Macs (gen >= 16, non-phone) take the 64x64 tile:
-    // M4 Pro paired rep5x2 pp2048 +1.1~2.4%, pp512 neutral. M3 Pro pp512 -1.4%
-    // keeps gen <= 15 off; phones ('p') stay off pending calibration. Older OS
-    // exposes no architecture -> off (conservative).
-    if (@available(iOS 17.0, macOS 14.0, *)) {
-        const char* archName = [[[[ctx device] architecture] name] UTF8String];
-        const char* kPrefix = "applegpu_g";
-        if (archName != nullptr && strncmp(archName, kPrefix, strlen(kPrefix)) == 0) {
-            const char* p = archName + strlen(kPrefix);
-            int gen = atoi(p);
-            char size = archName[strlen(archName) - 1];
-            mPreferM64Gemm = mSimdGroupMatrix && gen >= 16 && size != 'p';
-        }
-    }
-//    MNN_PRINT("Metal device name %s, open tensor: %d\n\n", [[[ctx device] name] UTF8String], mTensorOps);
+    // ---- Layer 2: hardware identity ----
+    mGpuInfo = parseGpuInfo([ctx device]);
+
+    // ---- Layer 3: cross-op route policy ----
+    // Only enable tensor API where it maps to in-core neural accelerators
+    // (gen >= 17); earlier Metal 4 chips reuse the simdgroup kernels.
+    mUseTensorOps = mMetal4TensorApi && mGpuInfo.gen >= 17;
     mStaticAllocator.reset(new EagerBufferAllocator(allocator));
     mDynamic.resize(METAL_SEPERATE_MAX_COUNT);
     for (auto& buf : mDynamic) {
@@ -1795,6 +1921,11 @@ MetalRuntime::MetalRuntime(void* context) {
 }
 
 MetalRuntime::~ MetalRuntime() {
+    {
+        std::unique_lock<std::mutex> _l(gContext->pLock);
+        MNN_ASSERT(gContext->runtimeCount > 0);
+        --gContext->runtimeCount;
+    }
     if(mContext) {
         CFRelease(mContext);
     }
@@ -2023,7 +2154,7 @@ Backend* MetalRuntime::onCreate(const BackendConfig* config, Backend* origin) co
         auto ctx = (__bridge MNNMetalContext *)mContext;
         auto mmap = BufferAllocator::Allocator::createMmap(hint().weightMemoryPath.c_str(), prefix.c_str(), posfix.c_str(), autoRemove);
         std::shared_ptr<BufferAllocator::Allocator> mmapMem(new MetalWrapAllocator(mmap, [ctx device]));
-        mStaticAllocator.reset(new EagerBufferAllocator(mmapMem, 32, 1024 * 1024 * 1024));
+        mStaticAllocator.reset(new EagerBufferAllocator(mmapMem, 64, 1024 * 1024 * 1024));
         mStaticAllocatorMMap = mStaticAllocator;
     }
     BackendConfig::PrecisionMode precision = mDefaultConfig.precision;
@@ -2098,6 +2229,19 @@ private:
     id<MTLDevice> mDevice;
 };
 
+static int releaseMetalContext() {
+    if (gContext == nullptr) {
+        return 0;
+    }
+    std::unique_lock<std::mutex> lock(gContext->pLock);
+    if (gContext->runtimeCount != 0) {
+        return 1;
+    }
+    gContext->pContext = nil;
+    gContext->pDevice = nil;
+    return 0;
+}
+
 void registerMetalRuntimeCreator() {
     // according to
     // https://developer.apple.com/library/archive/documentation/DeviceInformation/Reference/iOSDeviceCompatibility/HardwareGPUInformation/HardwareGPUInformation.html
@@ -2117,13 +2261,22 @@ void registerMetalRuntimeCreator() {
     }
 }
 } // namespace MNN
+
+extern "C" int MNNMetalReleaseContext(void) {
+    return MNN::releaseMetalContext();
+}
 #else
 namespace MNN {
 void registerMetalRuntimeCreator() {
 }
+void MetalOpProfileFlush() {
+}
 };
 int MNNMetalGetTensorContent(MNNMetalTensorContent* content, void* tensor) {
     return -1;
+}
+extern "C" int MNNMetalReleaseContext(void) {
+    return 0;
 }
 
 #endif

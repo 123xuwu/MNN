@@ -4,20 +4,19 @@
 //
 //  Metal execution for OpType_GatedRMSNorm: out = RMSNorm(x) * silu(z).
 //
-//  Replaces what used to be discovered at runtime by
-//  MetalBackend::matchLinearAttnGatedNormFolds, which walked the
-//  Raster/Cast/RMSNorm/SILU/MUL/Raster chain and claimed its six executions.
-//  The exporter now emits this op directly, so the backend just runs it.
+//  The exporter emits this op directly, so the backend runs one execution instead
+//  of matching a Raster/Cast/RMSNorm/SILU/MUL/Raster chain at runtime.
 //
-//  The kernel is unchanged (MetalGatedNormShader.hpp): its RMS reduction mirrors
-//  layernorm_c4_rms_sg line for line, which is what makes the result bit-identical
-//  to the unfused chain in fp32 builds. Do not "optimize" the grid or the
-//  reduction order — see skills/metal-optimize/kernel-dev-and-optimize.md §2.4.4.
+//  The kernel (MetalGatedNormShader.hpp) mirrors layernorm_c4_rms_sg's RMS
+//  reduction line for line, which is what makes the result bit-identical to the
+//  unfused chain in fp32 builds. Do not "optimize" the grid or the reduction
+//  order — see skills/metal-optimize/kernel-dev-and-optimize.md §2.4.4.
 //
-//  Layout: x is NC4HW4 [outside, inside] with the head as the batch axis; z and
-//  the output are NC4HW4 [1, outside*inside] and contiguous. Reading z and
-//  writing out at the flattened index absorbs the two C4 repacks that used to
-//  bracket the chain (they are exact inverses).
+//  Layout: x is NC4HW4 [outside, inside] with the head folded into the batch axis
+//  (outside = z_batch * heads); z and the output are NC4HW4
+//  [z_batch, heads*inside]. Indexing z and out at (head*CU + c)*z_batch + b
+//  absorbs the two C4 repacks that bracket the chain (they are exact inverses).
+//  Decode is the z_batch == 1 case, where that folds back to a contiguous index.
 //
 
 #import "backend/metal/MetalBackend.hpp"
@@ -62,7 +61,11 @@ public:
         auto x    = inputs[0];
         mOutside  = x->length(0);
         mInside   = x->length(1);
+        mZBatch   = inputs[1]->length(0);
         if (mOutside <= 0 || mInside <= 0 || (mInside % 4) != 0) {
+            return NOT_SUPPORT;
+        }
+        if (mZBatch <= 0 || (mOutside % mZBatch) != 0) {
             return NOT_SUPPORT;
         }
         if (mResource->mGammaSize != mInside) {
@@ -72,9 +75,12 @@ public:
         const bool fp16   = mtbn->useFp16InsteadFp32();
         std::string ftype  = fp16 ? "half" : "float";
         std::string ftype4 = fp16 ? "half4" : "float4";
-        // One simdgroup per head keeps the RMS reduction inside a simdgroup,
-        // exactly as layernorm_c4_rms_sg does.
-        const int sgsPerTG = 1;
+        // Two simdgroups per TG, each handling an independent head (h = gid.y
+        // * SGS_PER_TG + sgitg). The RMS reduction stays inside a single
+        // simdgroup (simd_sum only), so the per-head reduction order is
+        // unchanged and the fp32 result remains bit-identical to the unfused
+        // chain — only the threadgroup occupancy improves.
+        const int sgsPerTG = 2;
 
         std::vector<std::string> keys = {"linear_attn_gated_norm", ftype,
                                          "sgs" + std::to_string(sgsPerTG)};
@@ -98,12 +104,13 @@ public:
         }
         mPipeline = pipeline;
 
-        mParam     = mtbn->getConstBuffer(4 * sizeof(int));
+        mParam     = mtbn->getConstBuffer(5 * sizeof(int));
         auto param = (int *)mParam.contents;
         param[0]   = mInside;
         param[1]   = mOutside;
         ((float *)param)[2] = mResource->mEps;
         param[3]   = 1; // gamma/beta are required, see the creator
+        param[4]   = mZBatch;
 
         mThreads = std::make_pair(MTLSizeMake(1, UP_DIV(mOutside, sgsPerTG), 1),
                                   MTLSizeMake(sgsPerTG * 32, 1, 1));
@@ -129,6 +136,7 @@ private:
     std::pair<MTLSize, MTLSize> mThreads;
     int mOutside = 0;
     int mInside  = 0;
+    int mZBatch  = 1;
 };
 
 class MetalGatedRMSNormCreator : public MetalBackend::Creator {

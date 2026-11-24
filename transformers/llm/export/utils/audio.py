@@ -1,9 +1,13 @@
+import copy
 import torch
-from .transformers import Decoder
+import torch.nn.functional as F
+from .transformers import Decoder, Rotary, Lfm3OfflineBackbone
+from .model_mapper import ModelMapper
 from .spinner import spinner_run
-from .torch_utils import onnx_export
+from .torch_utils import onnx_export, EncoderExport, embedding_scale
 
 class Audio(torch.nn.Module):
+    processor_family = "qwen2_audio"
     def __init__(self, audio, base):
         super().__init__()
         self.model_type = base.config.model_type
@@ -12,6 +16,7 @@ class Audio(torch.nn.Module):
         self.tokenizer = base.tokenizer
         self.config = base.config.origin_config
         self.hidden_size = base.config.hidden_size
+        self.embedding_scale = embedding_scale(base)
         self.llm_config = { 'is_audio': True }
         self.rope_ratio = 1.0
         self.quant_bit = 16
@@ -19,10 +24,30 @@ class Audio(torch.nn.Module):
         self.load()
 
     def get_config(self):
+        audio_type = self.llm_config.get('audio_type', 'whisper')
+        window = getattr(self, 'n_window', 0)
+        feature_type = audio_type if audio_type in ('conformer', 'usm') else 'whisper'
+        processor = {
+            'version': 2,
+            'family': self.processor_family,
+            'sample_rate': getattr(self, 'sampling_rate', 16000),
+            'mel_bins': getattr(self, 'feature_size', 128),
+            'n_fft': getattr(self, 'n_fft', 400 if feature_type == 'whisper' else 512),
+            'hop_length': getattr(self, 'hop_length', 160),
+            'window_length': 320 if feature_type == 'usm' else 400,
+            'input_layout': 'ct' if audio_type == 'qwen3_asr' else ('btc' if audio_type == 'usm' else 'bct'),
+            'window': window,
+            'mask_stride': 2,
+            'max_frames': 3000 if audio_type == 'whisper' and not window else 0,
+            'output_layout': 'tbc',
+        }
+        self.llm_config['audio_processor'] = processor
         return self.llm_config
 
     @staticmethod
     def get_audio(model_type):
+        if model_type in ('lfm3_audio_encoder', 'lfm3_omni_encoder'):
+            return Lfm3Audio
         audio_models = {
             'qwen2_audio_encoder': Qwen2Audio,
             'qwen3_asr_audio_encoder': Qwen3ASRAudio,
@@ -164,7 +189,7 @@ class Qwen2Audio(Audio):
 
         model = self.float()
         onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features),
+        onnx_export(EncoderExport(model, self.embedding_scale), (input_features),
                     onnx_model,
                     input_names=['input_features'],
                     output_names=['audio_embeds'],
@@ -230,6 +255,7 @@ class Qwen3ASRAudioExportModel(torch.nn.Module):
         return hidden_states.unsqueeze(0)
 
 class Qwen3ASRAudio(Audio):
+    processor_family = "qwen3_asr"
     def __init__(self, audio, base):
         super().__init__(audio, base)
         self.audio_embeds = None
@@ -263,6 +289,9 @@ class Qwen3ASRAudio(Audio):
         input_features = self.feature_extractor(
             audio_obj,
             sampling_rate=self.sampling_rate,
+            # Match Qwen3ASRProcessor instead of padding/truncating to 30 seconds.
+            padding=True,
+            truncation=False,
             return_attention_mask=True,
             return_tensors='pt'
         )['input_features'][0].to(dtype=torch.float32)
@@ -305,7 +334,7 @@ class Qwen3ASRAudio(Audio):
         input_features = torch.randn((self.feature_size, 3000))
         model = self.export_model.float().eval()
         onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features,),
+        onnx_export(EncoderExport(model, self.embedding_scale), (input_features,),
                     onnx_model,
                     input_names=['input_features'],
                     output_names=['audio_embeds'],
@@ -328,6 +357,7 @@ class AudioMlp(torch.nn.Module):
         return hidden_states
 
 class Qwen2_5OmniAudio(Qwen2Audio):
+    processor_family = "qwen2_5_omni"
     def __init__(self, audio, base):
         super().__init__(audio, base)
         self.quant_bit = 4
@@ -406,7 +436,7 @@ class Qwen2_5OmniAudio(Qwen2Audio):
         attention_mask = torch.randn([1, seq_len, seq_len])
         model = self.float()
         onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features, attention_mask),
+        onnx_export(EncoderExport(model, self.embedding_scale), (input_features, attention_mask),
                     onnx_model,
                     input_names=['input_features', 'attention_mask'],
                     output_names=['audio_embeds'],
@@ -418,6 +448,7 @@ class Qwen2_5OmniAudio(Qwen2Audio):
         return onnx_model
 
 class FunAudioChatAudio(Qwen2_5OmniAudio):
+    processor_family = "funaudiochat"
     def __init__(self, audio, base):
         super().__init__(audio, base)
         self.audio_pad_id = 151669
@@ -453,6 +484,8 @@ class Lfm2Audio(Audio):
 
     Supports audio understanding: audio → conformer → adapter → inject into LFM → text.
     """
+
+    processor_family = "lfm2_audio"
 
     def __init__(self, audio, base):
         # Store adapter and constants before super().__init__() using __dict__
@@ -567,7 +600,7 @@ class Lfm2Audio(Audio):
 
         input_features = torch.randn((1, 128, 1000))
         onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features,),
+        onnx_export(EncoderExport(model, self.embedding_scale), (input_features,),
                     onnx_model,
                     input_names=['input_features'],
                     output_names=['audio_embeds'],
@@ -779,6 +812,7 @@ class Gemma4AudioExportModel(torch.nn.Module):
 
 
 class Gemma4Audio(Audio):
+    processor_family = "gemma4"
     def __init__(self, audio, base):
         object.__setattr__(self, 'embed_audio_ref', base.embed_audio)
         super().__init__(audio, base)
@@ -885,9 +919,80 @@ class Gemma4Audio(Audio):
         input_features = torch.randn((1, 600, self.feature_size))
         model = self.export_model.float().eval()
         onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features,),
+        onnx_export(EncoderExport(model, self.embedding_scale), (input_features,),
                     onnx_model,
                     input_names=['input_features'],
                     output_names=['audio_embeds'],
                     dynamic_axes={"input_features": {1: "seq_len"}})
         return onnx_model
+
+
+class Lfm3Audio(Lfm2Audio):
+    processor_family = 'lfm3_audio'
+
+    def __init__(self, audio, base):
+        Audio.__init__(self, audio, base)
+        self.projector = base.audio_projector.float()
+        object.__setattr__(self, '_visual_ref', base.visual)
+        self.audio_embeds = None
+        self.quant_bit = 8
+
+    def load(self):
+        self.audio = self.audio.float()
+        self.downsample = self.audio.downsample
+        self.backbone = Lfm3OfflineBackbone(self.audio.lfm, window=self.audio.config.sliding_window)
+        self.audio_pad_id = self.config.audio_token_id
+        self.sampling_rate, self.feature_size = 16000, self.audio.config.num_mel_bins
+        self.n_fft, self.hop_length = 400, 160
+        self.llm_config.update(audio_type='lfm3_audio', audio_pad=self.audio_pad_id)
+        self.audio_start_token = '<|vision_start|>' if self.model_type == 'lfm3_omni' else ''
+        self.audio_end_token = '<|vision_end|>' if self.model_type == 'lfm3_omni' else ''
+        if self.audio_start_token:
+            self.llm_config.update(
+                audio_start=self.tokenizer.convert_tokens_to_ids(self.audio_start_token),
+                audio_end=self.tokenizer.convert_tokens_to_ids(self.audio_end_token))
+        from transformers.audio_utils import mel_filter_bank
+        filters = mel_filter_bank(self.n_fft // 2 + 1, self.feature_size, 0, 8000,
+                                  self.sampling_rate, norm='slaney', mel_scale='slaney')
+        self.register_buffer('mel_filters', torch.from_numpy(filters).float(), persistent=False)
+
+    def forward(self, features):
+        hidden_states = self.downsample(features).transpose(1, 2)
+        return self.projector(self.backbone(hidden_states)).transpose(0, 1)
+
+    def features(self, waveform):
+        waveform = torch.as_tensor(waveform, dtype=torch.float32)
+        length = waveform.shape[-1]
+        frames = max(0, (length - self.n_fft + self.hop_length - 1) // self.hop_length) + 1
+        waveform = F.pad(waveform, (0, self.n_fft + (frames - 1) * self.hop_length - length))
+        spectrum = torch.stft(waveform, self.n_fft, self.hop_length,
+                              window=torch.hann_window(self.n_fft), center=False, return_complex=True)
+        mel = self.mel_filters.T @ spectrum.abs().square()
+        return ((mel.clamp_min(1e-12).log10() + 4.0) / 4.0).unsqueeze(0)
+
+    def audio_process(self, waveform):
+        self.audio_embeds = self(self.features(waveform))
+        return self.audio_embeds.shape[0]
+
+    def str_to_ids(self, prompt):
+        import re
+        import librosa
+        embeddings = []
+        def replace(match):
+            waveform, _ = librosa.load(match.group(1), sr=self.sampling_rate)
+            count = self.audio_process(waveform)
+            embeddings.append(self.audio_embeds)
+            return self.audio_start_token + '<|audio|>' * count + self.audio_end_token
+        prompt = re.sub(r'<audio>(.*?)</audio>', replace, prompt)
+        self.audio_embeds = torch.cat(embeddings, dim=0) if embeddings else None
+        if self._visual_ref is not None:
+            return self._visual_ref.str_to_ids(prompt)
+        return self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt')['input_ids']
+
+    def export(self, onnx_path):
+        path = f'{onnx_path}/audio.onnx'
+        wrapper = EncoderExport(self, self.embedding_scale, output_axes=None)
+        onnx_export(wrapper, (torch.randn(1, self.feature_size, 160),), path,
+                    ['input_features'], ['audio_embeds'],
+                    {'input_features': {2: 'frames'}, 'audio_embeds': {0: 'tokens'}})
+        return path

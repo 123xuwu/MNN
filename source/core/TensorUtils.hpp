@@ -20,6 +20,7 @@
 #endif // CONSTANT
 
 namespace MNN {
+struct MemNode;
 struct TensorArrayAttr {
     // array size is dynamic or not
     bool isDynamicSize = false;
@@ -101,6 +102,9 @@ struct Tensor::InsideDescribe {
         bool applyQuant = false;
         bool isMutable = true;
         bool overlap = false; // Only used by strideSliceWrite now
+        // Storage group planned by Pipeline: a view points at its root, a root points at itself.
+        // Only Raster outputs become views; backends must not re-home any member.
+        Tensor* storageRoot = nullptr;
         int index = -1;
         int group = 0;
 		int channel_pack_num = 4;
@@ -113,11 +117,17 @@ struct Tensor::InsideDescribe {
     };
     std::shared_ptr<NativeInsideDescribe> mContent;
     SharedPtr<Backend::MemObj> mem;
+    // Non-owning CPU dynamic binding; valid until the memory plan is reset.
+    // Unlike mem, this survives the planning-time onReleaseBuffer.
+    MemNode* cpuDynamicNode = nullptr;
     int offset = 0;
     inline Backend* getBackend() const {
         return backend;
     }
     inline void setBackend(Backend* bn) {
+        if (bn == nullptr || (backend != nullptr && backend != bn)) {
+            cpuDynamicNode = nullptr;
+        }
         backend = bn;
     }
 private:
@@ -202,6 +212,10 @@ public:
 
     static size_t getRawSize(const Tensor* t);
     static void setRasterInputs(Command* cmd);
+
+    // Mapping and physical storage compatibility are checked separately before planning a view.
+    static bool isFullBufferView(const Tensor* source, const Tensor* view);
+    static bool isBufferLayoutCompatible(const Tensor* source, const Tensor* view, int channelPack);
 
     static bool refTensorContent(Tensor* dst, const Tensor* src);
 

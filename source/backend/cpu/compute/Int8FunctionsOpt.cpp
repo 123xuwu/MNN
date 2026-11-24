@@ -145,6 +145,19 @@ void MNNGemmInt8AddBiasScaleHp128_SME2_w8_Fp32(int8_t* dst, const int8_t* src, c
 }
 #endif // MNN_USE_NEON
 
+#ifdef MNN_USE_RVV
+#ifdef MNN_USE_SPARSE_COMPUTE
+extern void _MNNPackC4Int8ForMatMul_ASparse_RVV(int8_t* destOrigin, int8_t const** sourceGroup, const int32_t* info,
+                                                const int32_t* el);
+#endif
+extern void MNNBinaryMinInt8_RVV(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* inputRaw1,
+                                 ssize_t* inputScalesInt32, float* inputScalesFp32, const QuanPrePostParameters* params,
+                                 size_t elementSize, size_t needBroadcast);
+extern void MNNBinaryMaxInt8_RVV(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* inputRaw1,
+                                 ssize_t* inputScalesInt32, float* inputScalesFp32, const QuanPrePostParameters* params,
+                                 size_t elementSize, size_t needBroadcast);
+#endif
+
 /*
     layout should be optimized for int8
     source: source matrix is h x l
@@ -2064,6 +2077,17 @@ void MNNBinaryMulInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* 
 void MNNBinaryMinInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* inputRaw1, ssize_t* inputScalesInt32,
                       float* inputScalesFp32, const QuanPrePostParameters* params, size_t elementSize,
                       size_t needBroadcast) {
+    // No CoreInt8Functions slot exists for this kernel, so the RVV version is
+    // reached from here instead of through the function table. The scalar body
+    // stays compiled unconditionally: an RVV build running on a CPU without the
+    // V extension still takes this path.
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNBinaryMinInt8_RVV(outputRaw, inputRaw0, inputRaw1, inputScalesInt32, inputScalesFp32, params, elementSize,
+                             needBroadcast);
+        return;
+    }
+#endif
     int res = 0;
 #ifdef MNN_USE_SSE
     const int offset = 128;
@@ -2115,6 +2139,17 @@ void MNNBinaryMinInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* 
 void MNNBinaryMaxInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* inputRaw1, ssize_t* inputScalesInt32,
                       float* inputScalesFp32, const QuanPrePostParameters* params, size_t elementSize,
                       size_t needBroadcast) {
+    // No CoreInt8Functions slot exists for this kernel, so the RVV version is
+    // reached from here instead of through the function table. The scalar body
+    // stays compiled unconditionally: an RVV build running on a CPU without the
+    // V extension still takes this path.
+#ifdef MNN_USE_RVV
+    if (MNN::MNNGetCoreFunctions()->supportRVV) {
+        MNNBinaryMaxInt8_RVV(outputRaw, inputRaw0, inputRaw1, inputScalesInt32, inputScalesFp32, params, elementSize,
+                             needBroadcast);
+        return;
+    }
+#endif
     int res = 0;
 #ifdef MNN_USE_SSE
     const int offset = 128;
@@ -2162,6 +2197,7 @@ void MNNBinaryMaxInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* 
         outputData[i] = value;
     }
 }
+
 void MNNBinarySqdInt8(int8_t* outputRaw, const int8_t* inputRaw0, const int8_t* inputRaw1, ssize_t* inputScalesInt32,
                       float* inputScalesFp32, const QuanPrePostParameters* params, size_t elementSize,
                       size_t needBroadcast) {
@@ -2410,32 +2446,27 @@ static void MNNGetGemmUnit(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
 }
 
 static void MNNGetGemmUnitSdot(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
-    *UNIT = 8;
-    *SRC_UNIT = 4;
-    *DST_XUNIT = 12;
+    *UNIT = GEMM_INT8_UNIT_ARM82;
+    *SRC_UNIT = GEMM_INT8_SRC_UNIT_ARM82;
+    *DST_XUNIT = GEMM_INT8_DST_XUNIT_ARM82;
 }
 
 static void MNNGetGemmUnitI8mm(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
-    *UNIT = 8;
-    *SRC_UNIT = 8;
-    *DST_XUNIT = 10;
+    *UNIT = GEMM_INT8_UNIT_ARM86;
+    *SRC_UNIT = GEMM_INT8_SRC_UNIT_ARM86;
+    *DST_XUNIT = GEMM_INT8_DST_XUNIT_ARM86;
 }
 
 static void MNNGetGemmUnitRVV(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
     *UNIT = GEMM_INT8_UNIT;
     *SRC_UNIT = GEMM_INT8_SRC_UNIT;
-    *DST_XUNIT = 8;
+    *DST_XUNIT = GEMM_INT8_DST_XUNIT_RVV;
 }
 
 static void MNNGetGemmUnitSme2_HP32(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
-    *UNIT = 32;
-    *SRC_UNIT = 4;
-    *DST_XUNIT = 16;
-}
-static void MNNGetGemmUnitSme2_HP64(int* UNIT, int* SRC_UNIT, int* DST_XUNIT) {
-    *UNIT = 64;
-    *SRC_UNIT = 4;
-    *DST_XUNIT = 16;
+    *UNIT = GEMM_INT8_UNIT_SME2;
+    *SRC_UNIT = GEMM_INT8_SRC_UNIT_SME2;
+    *DST_XUNIT = GEMM_INT8_DST_XUNIT_SME2;
 }
 
 // ADD RVV suport
@@ -2804,8 +2835,9 @@ void MNNCoreInt8FunctionInit() {
 #ifdef MNN_USE_RVV
     if (core->supportRVV) {
         gCoreFunc->MNNGetGemmUnit = MNNGetGemmUnitRVV;
-        gCoreFunc->MNNPackC4Int8ForMatMul_A = _ArmBasicMNNPackC4ForMatMul_A<8, GEMM_INT8_SRC_UNIT, GEMM_INT8_UNIT>;
-        core->int8MatmulRelatedFunctions.eP = 8;
+        gCoreFunc->MNNPackC4Int8ForMatMul_A =
+            _ArmBasicMNNPackC4ForMatMul_A<GEMM_INT8_DST_XUNIT_RVV, GEMM_INT8_SRC_UNIT, GEMM_INT8_UNIT>;
+        core->int8MatmulRelatedFunctions.eP = GEMM_INT8_DST_XUNIT_RVV;
         gCoreFunc->Int8GemmKernel = MNNGemmInt8AddBiasScale_16x4_Unit_RVV;
         MNNRvvInitializeInt8FastPathFunctions(gCoreFunc);
         gCoreFunc->MNNAvgPoolInt8 = MNNAvgPoolInt8_RVV;
@@ -2814,6 +2846,9 @@ void MNNCoreInt8FunctionInit() {
         gCoreFunc->ConvDepthwiseLineInt8 = MNNLineDepthWiseInt8AddBiasScaleUnit_RVV;
         gCoreFunc->MNNMaxPoolInt8 = MNNMaxPoolInt8_RVV;
         gCoreFunc->MNNReluWithSlopeChannelInt8 = MNNReluWithSlopeChannelInt8_RVV;
+#ifdef MNN_USE_SPARSE_COMPUTE
+        gCoreFunc->MNNPackC4Int8ForMatMul_ASparse = _MNNPackC4Int8ForMatMul_ASparse_RVV;
+#endif
     }
 #endif
 #endif

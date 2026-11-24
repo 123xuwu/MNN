@@ -6,7 +6,9 @@
 //
 // #define MNN_OPEN_TIME_TRACE 1
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -15,11 +17,18 @@
 #include "prompt_cache_utils.hpp"
 #include <MNN/AutoTime.hpp>
 #include "core/TensorUtils.hpp"
+#include "core/AttentionMaskConvention.hpp"
 #include "cpp/ExprDebug.hpp"
 #include "llm/llm.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
+#ifdef MNN_LLM_DELEGATES
+#include "../delegates/LlmDelegate.hpp"
+#endif
 #include "tokenizer/tokenizer.hpp"
+#ifdef MNN_LLM_TOKEN_COMPRESS
+#include "token_compressor.hpp"
+#endif
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #include "omni.hpp"
@@ -33,6 +42,46 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+bool LlmResources::Resource::valid() const {
+    if (data) {
+        return size > 0 && size <= std::numeric_limits<size_t>::max() && path.empty() && !bounded && offset == 0;
+    }
+    if (path.empty()) {
+        return false;
+    }
+    if (!bounded) {
+        return offset == 0 && size == 0;
+    }
+    return size > 0 && offset <= INT64_MAX && size <= uint64_t(INT64_MAX) - offset;
+}
+
+std::string LlmResources::Resource::filePath() const {
+    if (!valid() || data) {
+        return {};
+    }
+    return bounded ? FileLoader::fileRegion(path, int64_t(offset), int64_t(size)) : path;
+}
+
+Llm* Llm::createLLM(std::shared_ptr<LlmResources> resources) {
+    if (!resources) {
+        return nullptr;
+    }
+    std::shared_ptr<LlmConfig> config(new LlmConfig(resources));
+    if (!config->config_.is_object()) {
+        MNN_ERROR("Invalid resource model configuration.\n");
+        return nullptr;
+    }
+#ifdef MNN_LLM_DELEGATES
+    if (!config->delegate().empty()) {
+        return createLlmDelegate(config);
+    }
+#endif
+    if (config->is_visual() || config->is_audio() || config->has_talker()) {
+        return new Omni(config);
+    }
+    return new Llm(config);
+}
 
 static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "cpu")
@@ -49,6 +98,8 @@ static MNNForwardType backend_type_convert(const std::string& type_str) {
         return MNN_FORWARD_VULKAN;
     if (type_str == "hexagon")
         return MNN_FORWARD_HEXAGON;
+    if (type_str == "qnn")
+        return MNN_FORWARD_QNN;
     if (type_str == "npu")
         return MNN_FORWARD_NN;
     return MNN_FORWARD_AUTO;
@@ -85,9 +136,34 @@ static inline void _llmOrigError(const char* msg) {
     } while (0)
 #endif // LLM_LOG_TO_STRING
 
+#if defined(MNN_LLM_PACKAGE_EXT) && MNN_LLM_PACKAGE_EXT
+bool openPackageFormat(const std::string& path, std::shared_ptr<LlmResources>& result);
+#else
+static bool openPackageFormat(const std::string& path, std::shared_ptr<LlmResources>& result) {
+    return tryReadLlmPackage(path, result);
+}
+#endif
+
+bool tryOpenLlmFile(const std::string& path, std::shared_ptr<LlmResources>& result) {
+    if (openPackageFormat(path, result)) {
+        return true;
+    }
+    return (has_suffix(path, ".mpack") || has_suffix(path, ".llm") || has_suffix(path, ".mnnllm")) &&
+           !MNNDirExist(path.c_str());
+}
+
 Llm* Llm::createLLM(const std::string& config_path) {
+    std::shared_ptr<LlmResources> resources;
+    if (tryOpenLlmFile(config_path, resources)) {
+        return createLLM(std::move(resources));
+    }
     std::shared_ptr<LlmConfig> config(new LlmConfig(config_path));
     Llm* llm = nullptr;
+#ifdef MNN_LLM_DELEGATES
+    if (!config->delegate().empty()) {
+        return createLlmDelegate(config);
+    }
+#endif
     if (config->is_visual() || config->is_audio() || config->has_talker()) {
         llm = new Omni(config);
     } else {
@@ -111,31 +187,32 @@ std::string Llm::dump_config() {
 void Llm::setChatTemplate() {
     if (!mTokenizer || !mConfig->config_.contains("jinja")) return;
     auto jinja = mConfig->config_["jinja"];
-    if (jinja.contains("chat_template")) {
-        ujson::json context_json = jinja.contains("context") ? jinja["context"] : ujson::json::object();
-        if (!context_json.is_object()) {
-            context_json = ujson::json::object();
-        }
-        if (mConfig->config_.contains("asr_language")) {
-            context_json["asr_language"] = mConfig->asr_language();
-        }
-        mTokenizer->set_chat_template(jinja["chat_template"].get<std::string>(), jinja.value("eos", ""),
-                                      context_json.dump());
+
+    auto context = ujson::json::object();
+    if (jinja.contains("bos") && jinja["bos"].is_string()) {
+        context["bos_token"] = jinja["bos"];
     }
-    if (jinja.contains("context") || mConfig->config_.contains("asr_language")) {
-        ujson::json context_json = jinja.contains("context") ? jinja["context"] : ujson::json::object();
-        if (!context_json.is_object()) {
-            context_json = ujson::json::object();
-        }
-        if (mConfig->config_.contains("asr_language")) {
-            context_json["asr_language"] = mConfig->asr_language();
-        }
-        mTokenizer->set_chat_template_context(context_json.dump());
+    if (jinja.contains("context") && jinja["context"].is_object()) {
+        context.merge(jinja["context"]);
+    }
+    if (mConfig->config_.contains("asr_language")) {
+        context["asr_language"] = mConfig->asr_language();
+    }
+
+    if (jinja.contains("chat_template")) {
+        mTokenizer->set_chat_template(jinja["chat_template"].get<std::string>(), jinja.value("eos", ""),
+                                      context.dump());
+    } else if (jinja.contains("bos") || jinja.contains("context") || mConfig->config_.contains("asr_language")) {
+        mTokenizer->set_chat_template_context(context.dump());
     }
 }
 
 bool Llm::set_config(const std::string& content) {
-    mConfig->config_.merge(ujson::json::parse(content));
+    auto config = ujson::json::parse(content);
+    mConfig->config_.merge(config);
+    if (mSampler) {
+        mSampler->setConfig(mConfig);
+    }
     mConfig->mllm_config_ = mConfig->config_.contains("mllm") ? mConfig->config_["mllm"] : ujson::json();
     setChatTemplate();
     mAsync = mConfig->config_.value("async", true);
@@ -165,6 +242,10 @@ bool Llm::set_config(const std::string& content) {
 }
 
 void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after) {
+    if (!mConfig->debugCallbacksEnabled()) {
+        MNN_ERROR("Debug callbacks are disabled for this resource provider.\n");
+        return;
+    }
     mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
@@ -196,7 +277,7 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
         rtg->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);
     }
     std::string tmpPath = mConfig->tmp_path();
-    if (!tmpPath.empty() && !MNNCreateDir(tmpPath.c_str())) {
+    if (mConfig->diskCacheEnabled() && !tmpPath.empty() && !MNNCreateDir(tmpPath.c_str())) {
         // Everything below only writes into tmpPath, so a missing directory
         // costs the GPU shader cache and the mmap'd weight / KV cache -- a
         // silent per-run recompile, not a failure. Say so once, with the name,
@@ -221,12 +302,11 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     if (!mllm) {
         rtg->setHintPtr(Interpreter::KVCACHE_INFO, mMeta.get());
     }
-    if (backend_type_convert(mConfig->backend_type(mllm)) != 0) { // not cpu
+    if (mConfig->diskCacheEnabled() && backend_type_convert(mConfig->backend_type(mllm)) != 0) { // not cpu
         std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";
         rtg->setCache(cacheFilePath + "/mnn_cachefile.bin");
     }
     rtg->setHint(MNN::Interpreter::CPU_SME2_NEON_DIVISION_RATIO, mConfig->config_.value("cpu_sme2_neon_division_ratio", 41));
-    rtg->setHint(MNN::Interpreter::CPU_SME_CORES, mConfig->config_.value("cpu_sme_core_num", 2));
     rtg->setHint(MNN::Interpreter::MMAP_FILE_SIZE, mConfig->mmap_size());
 }
 
@@ -273,7 +353,7 @@ void Llm::initRuntime() {
     _initDebug();
 #endif
     // get linear input thresholds and max values
-    if (mConfig->config_.value("enable_debug", false)) {
+    if (mConfig->debugCallbacksEnabled() && mConfig->config_.value("enable_debug", false)) {
         mRuntimeManager->setMode(MNN::Interpreter::Session_Debug);
     }
 }
@@ -299,7 +379,19 @@ void Llm::setSpeculativeConfig() {
             mInSpec = false;
             return;
         }
-        mDraftLength = mConfig->draft_predict_length();
+        if (specultive_type == "dflash") {
+            // DFlash verifies a full dflash_block_size block; pool/mask/tuning
+            // key off (mDraftLength+1, all_logits), so this must be block-1.
+            int block = mConfig->dflash_block_size();
+            mDraftLength = block > 1 ? block - 1 : 1;
+            if (mConfig->config_.contains("draft_predict_length") &&
+                mConfig->draft_predict_length() != mDraftLength) {
+                MNN_PRINT("Warning: draft_predict_length is ignored for DFlash; "
+                          "verify length is dflash_block_size=%d.\n", block);
+            }
+        } else {
+            mDraftLength = mConfig->draft_predict_length();
+        }
         mInSpec = true;
     }
 }
@@ -322,9 +414,17 @@ bool Llm::load() {
     std::string tokenizer_path = mConfig->tokenizer_file();
     std::string model_path = mConfig->llm_model();
     std::string weight_path = mConfig->llm_weight();
-    if (!checkFile(tokenizer_path, "tokenizer file") ||
-        !checkFile(model_path, "LLM model file") ||
-        !checkFile(weight_path, "LLM weight file")) {
+    auto readable = [&](const std::string& path) {
+        const auto r = mConfig->resource(path);
+        if (!r.valid() || (!r.data && !FileLoader(r.filePath().c_str(), true).valid())) {
+            MNN_ERROR("Cannot read model resource: %s\n", path.c_str());
+            return false;
+        }
+        return true;
+    };
+    if (!readable(model_path) || !readable(tokenizer_path) || !readable(weight_path) ||
+        (mConfig->needsEmbeddingFile() && !readable(mConfig->embedding_file())) ||
+        (mConfig->has_ple() && !readable(mConfig->ple_embed_file()))) {
         return false;
     }
     MNN::Express::ExecutorScope s(mExecutor);
@@ -334,16 +434,17 @@ bool Llm::load() {
     // destroy the Backend, causing use-after-free when module destructor runs.
     mModulePool.clear();
     mModule.reset();
+    mMaskCache.clear();
     initRuntime();
     // init module status
     // 1. load vocab
-    mTokenizer.reset(Tokenizer::createTokenizer(tokenizer_path));
+    mTokenizer.reset(Tokenizer::createTokenizer(mConfig->resource(tokenizer_path)));
     if (mTokenizer == nullptr) {
         MNN_ERROR("[Error]: Failed to load tokenizer from: %s\n", tokenizer_path.c_str());
         return false;
     }
     // 2. load context
-    {
+    if (!mConfig->resources_) {
         std::ifstream contextFile(mConfig->context_file());
         if (contextFile.is_open()) {
             std::ostringstream contextStream;
@@ -362,15 +463,22 @@ bool Llm::load() {
         }
     }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
+    if (!mDiskEmbedding->valid()) {
+        return false;
+    }
     // PLE (Per-Layer Embeddings) for gemma4
     if (mConfig->has_ple()) {
         mPleEmbedding.reset(new DiskEmbedding(mConfig, mConfig->ple_embed_file(), mConfig->ple_embed_dim(), mConfig->ple_quant()));
+        if (!mPleEmbedding->valid()) {
+            return false;
+        }
     }
     setChatTemplate();
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     // 3. load model
     Module::Config module_config;
-    if (mConfig->backend_type() == "opencl" || mConfig->backend_type() == "vulkan" || mConfig->backend_type() == "npu") {
+    if (mConfig->backend_type() == "opencl" || mConfig->backend_type() == "vulkan" ||
+        mConfig->backend_type() == "npu" || mConfig->backend_type() == "qnn") {
         module_config.shapeMutable = false;
     } else {
         module_config.shapeMutable = true;
@@ -378,7 +486,7 @@ bool Llm::load() {
     module_config.rearrange    = true;
     // using base module for lora module
     if (mBaseModule != nullptr) {
-        module_config.base = mBaseModule;
+        module_config.base = mBaseModule.get();
     }
     // load single model
     std::vector<std::string> inputNames {"input_ids", "attention_mask", "position_ids", "logits_index"};
@@ -394,15 +502,14 @@ bool Llm::load() {
         outputNames.emplace_back("hidden_states");
     }
 
-    mRuntimeManager->setExternalFile(weight_path);
     if (mConfig->has_deepstack()) {
         inputNames.emplace_back("deepstack_embeds");
     }
     if (mConfig->has_ple()) {
         inputNames.emplace_back("ple_embeddings");
     }
-    mModule.reset(Module::load(inputNames, outputNames, model_path.c_str(), mRuntimeManager, &module_config));
-    mRuntimeManager->setExternalFile("");
+    mModule.reset(
+        mConfig->loadModule(inputNames, outputNames, model_path, mRuntimeManager, &module_config, weight_path));
     if(nullptr == mModule) {
         MNN_ERROR("[Error]: Load module failed, please check model.\n");
         if(outputNames.size() > 1) {
@@ -434,31 +541,12 @@ bool Llm::load() {
     logitsLastIdx = _var<int>({-1}, {1});
     logitsAllIdx = _var<int>({0}, {1});
     // index match with seq_len
-    mAttentionMaskVarVec.resize(decode_type_num);
     mPositionIdsVarVec.resize(decode_type_num);
     for(int i = 0; i < decode_type_num; i++) {
         int index = 1;
         if(i > 0) {
             index = verify_length;
         }
-        // attentiion mask var
-        {
-            // Mask: lower triangular
-           if ((mConfig->backend_type() == "cpu" || mConfig->backend_type() == "metal") && mValidBlockSize.empty()) {
-               mAttentionMaskVarVec[i] = _Input({}, NCHW, halide_type_of<float>());
-               auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
-               ptr[0] = 0;
-           } else {
-                mAttentionMaskVarVec[i] = _Input({1, 1, index, index}, NCHW, halide_type_of<float>());
-                auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
-                for (int i = 0; i < index; i++) {
-                    for (int j = 0; j < index; j++) {
-                        ptr[index * i + j] = (j > i) * std::numeric_limits<float>::lowest();
-                    }
-                }
-           }
-        }
-
         if (mConfig->is_mrope()) {
             mPositionIdsVarVec[i] = _Input({mConfig->mrope_axes(), index}, NCHW, halide_type_of<int>());
         } else {
@@ -473,13 +561,58 @@ bool Llm::load() {
     }
     mContext->load_us += _t.durationInUs();
     mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
+    // init deepstack placeholder for visual models, same as Omni::load
+    if (mConfig->has_deepstack()) {
+        mDeepstackInput = Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0));
+    }
     return true;
 }
 
 Llm* Llm::create_lora(const std::string& lora_path) {
+    if (!mModule || mConfig->lora_) {
+        MNN_ERROR("Create LoRA adapters from a loaded base model.\n");
+        return nullptr;
+    }
     auto llm = new Llm(std::make_shared<LlmConfig>(*mConfig));
-    llm->set_config("{\"llm_model\": \"" + lora_path + "\", \"use_mmap\": false, \"use_cached_mmap\": false}");
-    llm->mBaseModule = mModule.get();
+    std::shared_ptr<LlmResources> adapter;
+    const bool absolute = !lora_path.empty() &&
+                          (lora_path[0] == '/' || lora_path[0] == '\\' ||
+                           (lora_path.size() > 1 && lora_path[1] == ':'));
+    const auto adapterPath = !absolute && !mConfig->resources_ ? mConfig->base_dir_ + lora_path : lora_path;
+    if (tryOpenLlmFile(adapterPath, adapter)) {
+        if (!adapter || !adapter->resource("lora.mnn").valid()) {
+            MNN_ERROR("Invalid LoRA package.\n");
+            delete llm;
+            return nullptr;
+        }
+        llm->mConfig->lora_ = adapter;
+        llm->mConfig->resource_policy_.diskCache &= adapter->policy().diskCache;
+        llm->mConfig->resource_policy_.debugCallbacks &= adapter->policy().debugCallbacks;
+        llm->set_config("{\"use_mmap\": false, \"use_cached_mmap\": false}");
+    } else if (mConfig->resources_) {
+        struct LoraResources final : LlmResources {
+            std::shared_ptr<LlmResources> base;
+            std::string model, adapter;
+            Resource resource(const std::string& path) const override {
+                if (path != model) {
+                    return base->resource(path);
+                }
+                Resource result;
+                result.path = adapter;
+                return result;
+            }
+            Policy policy() const override { return base->policy(); }
+        };
+        auto resources = std::make_shared<LoraResources>();
+        resources->base = mConfig->resources_;
+        resources->model = LlmConfig::relativeResourcePath("", mConfig->llm_model());
+        resources->adapter = lora_path;
+        llm->mConfig->resources_ = std::move(resources);
+        llm->set_config("{\"use_mmap\": false, \"use_cached_mmap\": false}");
+    } else {
+        llm->set_config("{\"llm_model\": \"" + lora_path + "\", \"use_mmap\": false, \"use_cached_mmap\": false}");
+    }
+    llm->mBaseModule = mModule;
     auto res = llm->load();
     if (!res) {
         MNN_ERROR("[MNN:LLM] Load Lora error\n");
@@ -497,7 +630,12 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
         return;
     }
     // FIXME: Currently OpenCL Don't support KVMeta
-    if (mConfig->backend_type() == "opencl") {
+    if (!mRuntimeManager || mConfig->backend_type() == "opencl") {
+        return;
+    }
+    // The tuned hint (OP_ENCODER_NUMBER_FOR_COMMIT) is only read by the Metal and OpenCL backends. On Hexagon
+    // the 7 x 3 decode forwards below change nothing and cost about a second of startup on Qwen3.5-4B.
+    if (mConfig->backend_type() == "hexagon") {
         return;
     }
     int decode_seq = 1;
@@ -513,29 +651,42 @@ void Llm::tuning(TuneType type, std::vector<int> candidates) {
         int verify_length = mDraftLength + 1;
         decode_seq = verify_length;
     }
+    // Tag the tuning forwards like a real verify block, or they measure another path.
+    const bool tuneSpecBlock = mInSpec && decode_seq > 1 && nullptr != mGenerationStrategy &&
+                               mGenerationStrategy->marksSpecBlock();
     int64_t min_time     = INT64_MAX;
     int prefer_candidate = 10;
     for (auto& candidate : candidates) {
         mRuntimeManager->setHint(MNN::Interpreter::OP_ENCODER_NUMBER_FOR_COMMIT, candidate);
-        Timer _t;
-        std::vector<int> input_ids(decode_seq, 0);
-        auto outputs = forwardVec(input_ids);
-        if(outputs.empty()) {
-            return;
+        // Perf noise is additive-positive, so min-of-reps is the robust pick.
+        int64_t candidate_time = INT64_MAX;
+        for (int rep = 0; rep < 3; ++rep) {
+            Timer _t;
+            std::vector<int> input_ids(decode_seq, 0);
+            if (tuneSpecBlock) {
+                mMeta->spec_block = decode_seq;
+            }
+            auto outputs = forwardVec(input_ids);
+            mMeta->spec_block = 0; // before any early return: a stale tag breaks the next prefill
+            if(outputs.empty()) {
+                return;
+            }
+            auto logits = outputs[0];
+            if (nullptr == logits.get()) {
+                return;
+            }
+            if (logits->getInfo()->size == 0) {
+                return;
+            }
+            auto token   = sample(logits);
+            auto rep_time = _t.durationInUs();
+            if (rep_time < candidate_time) {
+                candidate_time = rep_time;
+            }
         }
-        auto logits = outputs[0];
-        if (nullptr == logits.get()) {
-            return;
-        }
-        if (logits->getInfo()->size == 0) {
-            return;
-        }
-        auto token   = sample(logits);
-        auto time = _t.durationInUs();
-        if (time < min_time) {
+        if (candidate_time < min_time) {
             prefer_candidate = candidate;
-            min_time         = time;
-            // MNN_PRINT("op encode number:%d, decode time: %lld us\n", candidate, time);
+            min_time         = candidate_time;
         }
     }
     mRuntimeManager->setHint(MNN::Interpreter::OP_ENCODER_NUMBER_FOR_COMMIT, prefer_candidate);
@@ -603,6 +754,10 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     mGenerateParam->validLogitSize = 0;
     mGenerateParam->validLogitStart = 0;
     std::vector<Express::VARP> inputs {hiddenState, mask, inputPos, logitsIndex};
+    // deepstack arg for visual models; when Omni has not supplied via mExtraArgs, add here
+    if (mConfig->has_deepstack() && mDeepstackInput.get() && extraArgs.empty()) {
+        extraArgs.push_back(mDeepstackInput);
+    }
     inputs.insert(inputs.end(), extraArgs.begin(), extraArgs.end());
     std::vector<Express::VARP> outputs = selectModule->onForward(inputs);
 
@@ -827,7 +982,13 @@ int Llm::sample(VARP logits, int offset, int size) {
     auto logitsShape = logits->getInfo()->dim;
     if (offset && size) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
-        logits = _Const(logits->readMap<float>() + offset, {size}, NHWC, halide_type_of<float>());
+        auto logitsPtr = logits->readMap<float>();
+        if (nullptr == logitsPtr) {
+            MNN_ERROR("[LLM] sample: logits read failed, backend execution stopped\n");
+            mContext->status = LlmStatus::INTERNAL_ERROR;
+            return -1;
+        }
+        logits = _Const(logitsPtr + offset, {size}, NHWC, halide_type_of<float>());
     }
     auto token_id = mSampler->sample(logits);
     return token_id;
@@ -896,6 +1057,21 @@ void Llm::eraseHistory(size_t begin, size_t end) {
     if (mMeta->remove != 0) {
         MNN_ERROR("MNN-LLM: erase history hasn't been executed by response, override erase info\n");
     }
+    if (begin > 0 || end < mMeta->previous) {
+        if (mHasLinearAttention < 0) {
+            bool graphValid = false;
+            const auto graph = mConfig->resource(mConfig->llm_model());
+            const bool hasLinear = modelHasLinearAttention(graph.filePath(), graph.data, graph.size, &graphValid);
+            if (!graphValid) {
+                MNN_ERROR("Cannot inspect model graph for partial history removal.\n");
+                return;
+            }
+            mHasLinearAttention = hasLinear ? 1 : 0;
+        }
+        if (mHasLinearAttention == 1 && replayKeptHistory(begin, end)) {
+            return;
+        }
+    }
     mMeta->remove = mMeta->previous - begin;
     int revertNumber = 0;
     if (end != mMeta->previous) {
@@ -912,6 +1088,56 @@ void Llm::eraseHistory(size_t begin, size_t end) {
         std::lock_guard<std::mutex> _l(mContext->mutex);
         mContext->history_tokens.resize(mContext->history_tokens.size() - mMeta->remove);
     }
+}
+
+// Linear-attention state folds every past token and cannot drop a span, so the kept tokens are prefilled again
+// from an empty state. Returns false, leaving everything untouched, when the tokens cannot be replayed.
+bool Llm::replayKeptHistory(size_t begin, size_t end) {
+    if (mContext->status == LlmStatus::NOT_LOADED || mContext->status == LlmStatus::INTERNAL_ERROR) {
+        return false;
+    }
+    const size_t previous = mMeta->previous;
+    std::vector<int> kept;
+    {
+        std::lock_guard<std::mutex> _l(mContext->mutex);
+        if (mContext->history_tokens.size() < previous) {
+            MNN_ERROR("MNN-LLM: linear attention needs the full token history to erase part of it\n");
+            return false;
+        }
+        kept.assign(mContext->history_tokens.begin(), mContext->history_tokens.begin() + begin);
+        kept.insert(kept.end(), mContext->history_tokens.begin() + end, mContext->history_tokens.begin() + previous);
+    }
+    if (!prepareHistoryReplay(kept)) {
+        MNN_ERROR("MNN-LLM: linear attention cannot erase part of a multimodal history; erase all of it instead\n");
+        return false;
+    }
+    MNN::Express::ExecutorScope s(mExecutor);
+    auto embeds = embedding(kept);
+    if (embeds == nullptr) {
+        return false;
+    }
+    const auto status = mContext->status;
+    const int genSeqLen = mContext->gen_seq_len;
+    // A cancelled or finished generation must not block the rebuild; zero gen_seq_len selects the prefill module.
+    mContext->status = LlmStatus::RUNNING;
+    mContext->gen_seq_len = 0;
+    mContext->all_seq_len = 0;
+    mMeta->remove = previous;
+    mMeta->reserve = nullptr;
+    mMeta->n_reserve = 0;
+    auto outputs = forwardVec(embeds);
+    mContext->gen_seq_len = genSeqLen;
+    std::lock_guard<std::mutex> _l(mContext->mutex);
+    if (outputs.empty()) {
+        // Leave a pending full reset so the next prefill starts from an empty, consistent history.
+        mMeta->remove = mMeta->previous;
+        mContext->history_tokens.clear();
+        return true;
+    }
+    mContext->status = status;
+    updateContext((int)kept.size(), 0);
+    mContext->history_tokens = std::move(kept);
+    return true;
 }
 
 bool Llm::stoped() {
@@ -967,6 +1193,7 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
         }
     }
 
+    KVMeta::CapacityScope capacityScope(mMeta.get(), input_ids.size(), max_tokens);
     {
         std::lock_guard<std::mutex> _l(mContext->mutex);
         mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
@@ -1007,6 +1234,10 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
     return mContext->output_tokens;
 }
 
+bool Llm::has_chat_template() const {
+    return !mTokenizer->chat_template().empty();
+}
+
 std::string Llm::apply_chat_template(const std::string& user_content) const {
     return mTokenizer->apply_chat_template(user_content, mConfig->system_prompt());
 }
@@ -1015,12 +1246,17 @@ std::string Llm::apply_chat_template(const ChatMessages& chat_prompts) const {
     return mTokenizer->apply_chat_template(chat_prompts, true);
 }
 
-std::vector<int> Llm::tokenizer_encode(const std::string& user_content) {
-    return mTokenizer->encode(user_content);
+std::vector<int> Llm::tokenizer_encode(const std::string& user_content, bool add_special_tokens) {
+#ifdef MNN_LLM_TOKEN_COMPRESS
+    return TokenCompression::encodePrompt(mTokenizer.get(), user_content, mConfig->token_compress(),
+                                          add_special_tokens);
+#else
+    return mTokenizer->encode(user_content, add_special_tokens);
+#endif
 }
 
-std::vector<int> Llm::tokenizer_encode(const MultimodalPrompt& multimodal_input) {
-    return mTokenizer->encode(multimodal_input.prompt_template);
+std::vector<int> Llm::tokenizer_encode(const MultimodalPrompt& multimodal_input, bool add_special_tokens) {
+    return Llm::tokenizer_encode(multimodal_input.prompt_template, add_special_tokens);
 }
 
 void Llm::response(const MultimodalPrompt& multimodal_input,
@@ -1031,7 +1267,8 @@ void Llm::response(const MultimodalPrompt& multimodal_input,
     if (mConfig->use_template()) {
         multimodal_input_copy.prompt_template = apply_chat_template(multimodal_input_copy.prompt_template);
     }
-    std::vector<int> input_ids = tokenizer_encode(multimodal_input_copy);
+    const bool add_special_tokens = !mConfig->use_template() || mTokenizer->chat_template().empty();
+    std::vector<int> input_ids = tokenizer_encode(multimodal_input_copy, add_special_tokens);
     response(input_ids, os, end_with, max_new_tokens);
 }
 
@@ -1043,6 +1280,7 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
         max_tokens = mConfig->max_new_tokens();
     }
     int seqLen = input_embeds->getInfo()->dim[mSeqLenIndex];
+    KVMeta::CapacityScope capacityScope(mMeta.get(), seqLen, max_tokens);
     mContext->prompt_len = seqLen;
 
     // Disable record queue during prefill for better performance
@@ -1150,13 +1388,16 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
     CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     auto prompt = user_content;
+    bool add_special_tokens = true;
     if (mConfig->use_template()) {
         prompt = apply_chat_template(user_content);
         if (prompt.empty()) {
             prompt = user_content;
+        } else {
+            add_special_tokens = mTokenizer->chat_template().empty();
         }
     }
-    std::vector<int> input_ids = tokenizer_encode(prompt);
+    std::vector<int> input_ids = tokenizer_encode(prompt, add_special_tokens);
     if (input_ids.empty()) {
         MNN_ERROR("[Error]: empty input_ids after tokenizer_encode in Llm::response(text)\n");
         mContext->status = LlmStatus::INTERNAL_ERROR;
@@ -1172,6 +1413,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
         return;
     }
     std::string prompt = apply_chat_template(chat_prompts);
+    const bool add_special_tokens = mTokenizer->chat_template().empty();
 
     // Prompt cache: compare current prompt text against the previous turn's to
     // find the common prefix, then only tokenize and prefill the new suffix.
@@ -1187,7 +1429,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
 
         // If history was trimmed (text_common < cached), fall back to full
         // re-prefill rather than conditioning on stale KV entries.
-        if (text_common < mCachedPromptText.size()) {
+        if (text_common < mCachedPromptText.size() || !preparePromptCache(prompt)) {
             // History was trimmed — clear all stale state and do full re-prefill.
             mCachedPromptText.clear();
             mContext->all_seq_len = 0;
@@ -1196,7 +1438,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
                 mContext->history_tokens.clear();
             }
             mMeta->remove = mMeta->previous;
-            std::vector<int> input_ids = tokenizer_encode(prompt);
+            std::vector<int> input_ids = tokenizer_encode(prompt, add_special_tokens);
             size_t history_before = input_ids.size(); // generate() pushes these first
             response(input_ids, os, end_with, max_new_tokens);
             if (mConfig->prompt_cache()) {
@@ -1207,15 +1449,9 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
 
         // Tokenize the full prompt and split at a token boundary rather than
         // tokenizing a text substring (which can land mid-token for BPE/UTF-8).
-        std::vector<int> full_tokens = tokenizer_encode(prompt);
-        // Detect prefix token count (BOS, etc.) by encoding an empty string.
-        // tokenizer_encode("") returns only the prefix tokens that are
-        // automatically prepended to every input (e.g., <|begin_of_text|>).
-        // This count is used to skip prefix tokens when mapping text
-        // positions to token indices, since they don't correspond to any
-        // prompt text bytes. Assumption: prefix tokens are constant across
-        // inputs for a given tokenizer configuration.
-        size_t prefix_count = tokenizer_encode("").size();
+        std::vector<int> full_tokens = tokenizer_encode(prompt, add_special_tokens);
+        // Template control tokens correspond to text bytes; only skip automatically inserted tokens.
+        size_t prefix_count = tokenizer_encode("", add_special_tokens).size();
         size_t char_pos = 0;
         size_t token_split = prefix_count; // start after prefix tokens
         for (size_t i = prefix_count; i < full_tokens.size(); i++) {
@@ -1272,7 +1508,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
             }
             mMeta->remove = mMeta->previous;
         }
-        std::vector<int> input_ids = tokenizer_encode(prompt);
+        std::vector<int> input_ids = tokenizer_encode(prompt, add_special_tokens);
         // history_before accounts for input_ids that generate() pushes first
         size_t history_before = input_ids.size();
         response(input_ids, os, end_with, max_new_tokens);
@@ -1308,8 +1544,7 @@ void Llm::updateCachedPromptText(const ChatMessages& chat_prompts, size_t histor
     if (!response_text.empty()) {
         msgs_with_response.emplace_back("assistant", response_text);
     }
-    mCachedPromptText = mTokenizer->apply_chat_template(msgs_with_response, false);
-    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    syncPromptCache(msgs_with_response);
 }
 
 Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
@@ -1318,6 +1553,8 @@ Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
     mContext.reset(new LlmContext);
     mMeta.reset(new KVMeta);
     mMeta->layer_nums = mConfig->layer_nums();
+    // KV-shared layers reuse their owner's cache file.
+    mPrefixCacheNums = mConfig->layer_nums() - mConfig->num_kv_shared_layers();
     mMeta->attn_scale = mConfig->attn_scale();
     mGenerateParam.reset(new GenerationParams);
     mGenerateParam->timeout_ms = mConfig->timeout_ms();
@@ -1366,72 +1603,29 @@ bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
     mPrefixCacheFileName = filename;
     mCallIndex = 0;
     mPrefixCacheMode = true;
-
+    mMeta->layer_index = 0;
+    ++mMeta->prefix_session_id;
 
     mIsPrefixFileExist = true;
     // check kvcache, validate file existence
-    for(int i = 0; i < mConfig->layer_nums(); i++) {
+    for(int i = 0; i < mPrefixCacheNums; i++) {
         auto k_file = MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName) + "_" + std::to_string(i) + "_sync.k";
         if(!MNNFileExist(k_file.c_str())) {
             mIsPrefixFileExist = false;
             break;
         }
-        auto v_file = MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName) + "_" + std::to_string(i) + "_sync.v";
-        if(!MNNFileExist(v_file.c_str())) {
-            mIsPrefixFileExist = false;
-            break;
-        }
     }
 
-    // Further check: the real .k/.v data files must exist, be non-empty, and have consistent
-    // sizes across layers. This guards against cases where _sync markers remain but the
-    // actual data files were deleted / truncated / partially written, which would otherwise
-    // lead to a crash in CPUKVCacheManager::onAlloc (e.g. memset on a null mmap address).
     if (mIsPrefixFileExist) {
-        // Only "mix" (LA + regular attention) has intrinsically non-uniform
-        // per-layer KV sizes. Everything else (full / sliding / unset → "full")
-        // stays under the cross-layer uniformity check that catches partial or
-        // corrupted writes.
-        const bool isHybrid = (mConfig->attention_type() == "mix");
-        size_t refKeySize = 0;
-        size_t refValueSize = 0;
-        for (int i = 0; i < mConfig->layer_nums(); i++) {
-            auto base = MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName) + "_" + std::to_string(i);
-            auto k_data = base + ".k";
-            auto v_data = base + ".v";
-            if (!MNNFileExist(k_data.c_str()) || !MNNFileExist(v_data.c_str())) {
-                MNN_PRINT("Prefix cache data file missing: %s or %s\n", k_data.c_str(), v_data.c_str());
-                mIsPrefixFileExist = false;
-                break;
-            }
-            auto kfd = MNNOpenFile(k_data.c_str(), MNN_FILE_READ);
-            auto vfd = MNNOpenFile(v_data.c_str(), MNN_FILE_READ);
-            size_t kSize = (kfd == INVALID_FILE) ? INVALID_SIZE : MNNGetFileSize(kfd);
-            size_t vSize = (vfd == INVALID_FILE) ? INVALID_SIZE : MNNGetFileSize(vfd);
-            if (kfd != INVALID_FILE)
-                MNNCloseFile(kfd);
-            if (vfd != INVALID_FILE)
-                MNNCloseFile(vfd);
-            if (kSize == INVALID_SIZE || kSize == 0 || vSize == INVALID_SIZE || vSize == 0) {
-                MNN_PRINT("Prefix cache data file has invalid size: %s(%zu) %s(%zu)\n", k_data.c_str(), kSize,
-                          v_data.c_str(), vSize);
-                mIsPrefixFileExist = false;
-                break;
-            }
-            if (!isHybrid) {
-                if (i == 0) {
-                    refKeySize = kSize;
-                    refValueSize = vSize;
-                } else if (kSize != refKeySize || vSize != refValueSize) {
-                    // Non-hybrid: all layers share the same model shape, so their .k (and .v)
-                    // files must have identical sizes. Any mismatch means the cache directory
-                    // has been corrupted / partially overwritten and must be rebuilt.
-                    MNN_PRINT("Prefix cache size mismatch at layer %d: k=%zu(ref=%zu) v=%zu(ref=%zu)\n", i, kSize,
-                              refKeySize, vSize, refValueSize);
-                    mIsPrefixFileExist = false;
-                    break;
-                }
-            }
+        bool graphValid = false;
+        const auto graph = mConfig->resource(mConfig->llm_model());
+        mIsPrefixFileExist = validatePrefixCacheFiles(
+            graph.filePath(), MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName), mPrefixCacheNums,
+            graph.data, graph.size, &graphValid);
+        if (!graphValid) {
+            MNN_ERROR("Cannot validate model graph or prefix cache layer layout.\n");
+            mPrefixCacheMode = false;
+            return false;
         }
     }
 
@@ -1464,9 +1658,10 @@ void Llm::completePrefixWrite() {
     mMeta->file_flag = KVMeta::NoChange;
     mMeta->file_name = "";
     mMeta->layer_index = 0;
+    CHECK_LLM_RUNNING(mContext);
     // Create sync files to mark prefix cache as valid
     auto prefixDir = mConfig->prefix_cache_path();
-    for (int i = 0; i < mConfig->layer_nums(); i++) {
+    for (int i = 0; i < mPrefixCacheNums; i++) {
         auto base = MNNFilePathConcat(prefixDir, mPrefixCacheFileName) + "_" + std::to_string(i);
         auto k_file = base + ".k";
         if (MNNFileExist(k_file.c_str())) {
@@ -1485,14 +1680,33 @@ void Llm::completePrefixWrite() {
 
 bool Llm::reuse_kv() { return mConfig->reuse_kv(); }
 
+bool Llm::preparePromptCache(const std::string& prompt) {
+    if (!mConfig->prompt_cache_preserve_template()) {
+        return true;
+    }
+    const auto tokens = Llm::tokenizer_encode(prompt);
+    const size_t cached = mContext->all_seq_len;
+    std::lock_guard<std::mutex> lock(mContext->mutex);
+    auto& history = mContext->history_tokens;
+    if (mMeta->remove != 0 || cached == 0 || cached >= tokens.size() || cached > history.size() ||
+        !std::equal(history.begin(), history.begin() + cached, tokens.begin())) {
+        return false;
+    }
+    history.resize(cached);
+    return true;
+}
+
 void Llm::syncPromptCache(const ChatMessages& chat_prompts) {
     if (!mConfig->prompt_cache() || chat_prompts.empty())
         return;
-    // Override cached text with caller-provided messages (e.g. after
-    // deleteThinkPart processing in Android). Uses the same rendering
-    // and <think> stripping as updateCachedPromptText.
     mCachedPromptText = mTokenizer->apply_chat_template(chat_prompts, false);
-    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    if (mConfig->prompt_cache_preserve_template()) {
+        mCachedPromptText = evaluatedPromptText(mCachedPromptText, mContext->history_tokens, mContext->all_seq_len,
+                                              Llm::tokenizer_encode("").size(),
+                                              [this](int token) { return tokenizer_decode(token); });
+    } else {
+        MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+    }
 }
 
 static inline bool needNewVar(VARP var, int axis, int seq_len, int kv_seq_len = 0) {
@@ -1519,10 +1733,8 @@ VARP Llm::embedding(const std::vector<int>& input_ids) {
     mDiskEmbedding->embedding(input_ids, res->writeMap<float>());
     // scale_emb is in ONNX model, not here. C++ passes raw embedding.
 
-    // PLE embedding lookup (gemma4)
-    // mPleInput may be pre-set by Omni::embedding for multimodal prefill;
-    // update only if null or if seq_len matches (decode single token)
-    if (mPleEmbedding && (!mPleInput.get() || seq_len == 1)) {
+    // PLE embedding lookup (gemma4). Omni::embedding overrides it for multimodal prefill.
+    if (mPleEmbedding) {
         int ple_dim = mConfig->ple_embed_dim();
         float ple_scale = mConfig->ple_embed_scale();
         mPleInput = _Input({1, seq_len, ple_dim}, NCHW);
@@ -1550,90 +1762,42 @@ VARP Llm::gen_attention_mask(int seq_len) {
     if (mConfig->attention_mask() == "float") {
         // full and sliding mix, using normal mask
         if (mConfig->attention_type() == "mix") {
-            const int sliding_window = mConfig->sliding_window();
-            // mix attention mask
-            attentionMask = _Input({2, 1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<float>());
-            auto full_attn_ptr = attentionMask->writeMap<float>();
-            // full attn mask
-            for (int i = 0; i < seq_len; i++) {
-                const int query_pos = i + (kv_seq_len - seq_len);
-                for (int j = 0; j < kv_seq_len; j++) {
-                    if (j > query_pos) {
-                        full_attn_ptr[kv_seq_len * i + j] = std::numeric_limits<float>::lowest();
-                    } else {
-                        full_attn_ptr[kv_seq_len * i + j] = 0.0f;
-                    }
-                }
-            }
-            // sliding attn mask
-            auto sliding_attn_ptr = full_attn_ptr + seq_len * kv_seq_len;
-            const int query_pos_offset = kv_seq_len - seq_len;
-            for (int i = 0; i < seq_len; i++) {
-                const int query_pos = i + query_pos_offset;
-                for (int j = 0; j < kv_seq_len; j++) {
-                    const int key_pos = j;
-                    bool is_allowed = (key_pos <= query_pos) && (key_pos > query_pos - sliding_window);
-                    if (is_allowed) {
-                        sliding_attn_ptr[kv_seq_len * i + j] = 0.0f;
-                    } else {
-                        sliding_attn_ptr[kv_seq_len * i + j] = std::numeric_limits<float>::lowest();
-                    }
-                }
-            }
+            // Plane 0 full causal, plane 1 sliding window; the graph picks one per layer.
+            MaskRequest req;
+            req.seqLen   = seq_len;
+            req.kvSeqLen = kv_seq_len;
+            req.rank     = 4;  // -> {2, 1, 1, seq_len, kv_seq_len}
+            MaskPlane full;
+            full.type = AttentionMaskType::Causal;
+            MaskPlane sliding;
+            sliding.type          = AttentionMaskType::SlidingWindow;
+            sliding.slidingWindow = mConfig->sliding_window();
+            attentionMask = buildTwoPlaneMask(req, full, sliding);
             return attentionMask;
         }
         // Use square mask just for new generation token, save memory of attention mask
         kv_seq_len = seq_len;
-        if (mAttentionMaskVarVec.size() > 0) {
-            if(seq_len == 1) {
-                return mAttentionMaskVarVec[0];
-            }
-            if (mAttentionMaskVarVec.size() > 1 && seq_len == mDraftLength + 1) {
-                return mAttentionMaskVarVec[1];
-            }
-        }
 
-        // Mask: lower triangular
-       if ((mConfig->backend_type() == "cpu" || mConfig->backend_type() == "hexagon" || mConfig->backend_type() == "metal") && mValidBlockSize.empty()) {
-           attentionMask = _Input({}, NCHW, halide_type_of<float>());
-           auto ptr = attentionMask->writeMap<float>();
-           ptr[0] = 0;
-       } else {
-            attentionMask = _Input({1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<float>());
-            auto ptr = attentionMask->writeMap<float>();
-            for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < kv_seq_len; j++) {
-                    ptr[kv_seq_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
-                }
-            }
-       }
+        MaskRequest req;
+        req.type     = AttentionMaskType::Causal;
+        req.seqLen   = seq_len;
+        req.kvSeqLen = kv_seq_len;
+        req.rank     = 4;
+        // chunk_limits needs a stable mask rank across chunked forwards.
+        req.forceDense = !mValidBlockSize.empty();
+        if (seq_len == 1 || (mInSpec && seq_len == mDraftLength + 1)) {
+            return mMaskCache.obtain(req, mConfig->backend_type());
+        }
+        attentionMask = buildAttentionMask(req, mConfig->backend_type());
         return attentionMask;
     } else {
+        // Reused across steps, refilled only when the shape changes.
         if (needNewVar(attentionMask, 2, seq_len, kv_seq_len)) {
             attentionMask = _Input({1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<int>());
         } else {
             return attentionMask;
         }
-        auto ptr = attentionMask->writeMap<int>();
-        if (mConfig->attention_mask() == "glm") {
-            // chatglm
-            for (int i = 0; i < seq_len * kv_seq_len; i++) {
-                ptr[i] = 0;
-            }
-            if (seq_len > 1) {
-                for (int i = 1; i < seq_len; i++) {
-                    ptr[seq_len * i - 1] = 1;
-                }
-            }
-        } else {
-            bool is_glm2 = mConfig->attention_mask() == "glm2";
-            for (int i = 0; i < seq_len; i++) {
-                for (int j = 0; j < kv_seq_len; j++) {
-                    int row              = i + mContext->all_seq_len;
-                    ptr[seq_len * i + j] = is_glm2 ? j > row : j <= row;
-                }
-            }
-        }
+        fillCausalInt(attentionMask->writeMap<int>(), seq_len, kv_seq_len, mContext->all_seq_len);
         return attentionMask;
     }
 }
@@ -1714,7 +1878,7 @@ VARP Llm::gen_position_ids(int seq_len) {
 
 bool Llm::is_stop(int token_id) {
     CHECK_LLM_RUNNING_RET(mContext, true);
-    bool stop = mTokenizer->is_stop(token_id);
+    bool stop = !mConfig->ignore_eos() && mTokenizer->is_stop(token_id);
     if (stop) {
         mContext->status = LlmStatus::NORMAL_FINISHED;
     }

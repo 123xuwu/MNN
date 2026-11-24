@@ -30,7 +30,7 @@ public:
     static void unravelIndexHelper(int32_t* coordinate, const int32_t* mod, int size,
                                    int indice);
     static int computeStride(int32_t* strides, const int* shape, int length);
-    static void loadBlobData(FileLoader* loader, const Op* op, char* ptr, int size);
+    static bool loadBlobData(FileLoader* loader, const Op* op, char* ptr, int size);
 
     static bool canBlitFast(const Tensor::InsideDescribe::Region& region, const Tensor* dest, int pack = 4, bool swapnc = false, bool swapcw = false);
     static void turnToPackRegion(const Tensor::InsideDescribe::Region& region, Tensor::InsideDescribe::Region& c4Region,
@@ -49,7 +49,7 @@ public:
     
     static void rasterInputReset(const std::vector<Tensor*>& inputs, Tensor* output);
 
-    static void loadExternalDatas(FileLoader* loader, std::vector<char*> addrs, const int64_t* external);
+    static bool loadExternalDatas(FileLoader* loader, std::vector<char*> addrs, const int64_t* external);
     struct TensorConvertParameter {
         int batch;
         int channel;
@@ -75,6 +75,17 @@ public:
     // LayerNorm + SILU + MUL, since no backend has a fallback execution for it.
     static bool gatedRMSNormFusable(const Op* op, const std::vector<Tensor*>& inputs,
                                     const std::vector<Tensor*>& outputs, bool supportSimdGroupReduce);
+
+    // Same contract for the OpenCL (buffer mode) execution: the single source of
+    // truth for the geometry retention gate and the OpenCL creator. Looser than
+    // the Metal one — that kernel is decode-only and needs 4-aligned channels,
+    // while the OpenCL execution also carries an element-wise variant — and it
+    // fills in `heads`, which the kernels need to map x's row onto z's channel.
+    // externalGammaOk: also accept gamma / beta still in the external weight file (the geometry
+    // sees them before the loader inlines them for the creator); off for OpenCL.
+    static bool gatedRMSNormOpenCLOk(const Op* op, const std::vector<Tensor*>& inputs,
+                                     const std::vector<Tensor*>& outputs, int* outside = nullptr, int* inside = nullptr,
+                                     int* heads = nullptr, bool externalGammaOk = false);
 #endif
 
 };

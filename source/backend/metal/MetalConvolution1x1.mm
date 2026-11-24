@@ -24,33 +24,14 @@
 
 namespace MNN {
 
-static bool isQ4W16BlockSlices(int blockSlices) {
-    return blockSlices == 8 || blockSlices == 16 || blockSlices == 32 || blockSlices == 64;
-}
+// Must match the shader's SIMD_GROUP_WIDTH.
+static constexpr int kMetalSimdGroupWidth = 32;
 
-// Lanes per quant block for the Q4 16-byte decode GEMV (GEMV_QBLOCK_W16_MID).
-// A simdgroup owns `blocksPerSimdgroup` blocks. With `mid` lanes on a block,
-// 32/mid blocks are in flight and each lane walks `pairsPerBlock/mid` uint4
-// loads. One uint4 covers two C4 slices.
-// Pick the mid that minimises the loads on the critical path, preferring the
-// smallest on ties (longest contiguous run per lane).
-static int chooseQ4W16Mid(int blocksPerSimdgroup, int pairsPerBlock) {
-    int best = 1, bestCost = 1 << 30;
-    const int blocks = blocksPerSimdgroup > 1 ? blocksPerSimdgroup : 1;
-    for (int mid : {1, 2, 4, 8}) {
-        if (mid > pairsPerBlock || pairsPerBlock % mid != 0) {
-            continue;
-        }
-        const int slots = 32 / mid;
-        const int iters = UP_DIV(blocks, slots);
-        const int cost  = iters * (pairsPerBlock / mid);
-        if (cost < bestCost) {
-            bestCost = cost;
-            best = mid;
-        }
-    }
-    return best;
-}
+// Apple GPU device-memory cache line.
+static constexpr int kMetalCacheLineBytes = 128;
+
+// QKV seg buffer layout, shared with the shader's qkv_seg.
+static constexpr int kQKVSegFloats = 13;
 
 bool MetalConvolution1x1::isValid(const Convolution2D *conv, const Tensor *input) {
     auto common = conv->common();
@@ -62,8 +43,9 @@ bool MetalConvolution1x1::isValid(const Convolution2D *conv, const Tensor *input
 }
 
 MetalConvolution1x1::MetalConvolution1x1(Backend *backend, const MNN::Op *op) : MetalConvolutionCommon(backend, op, nullptr) {
-    auto conv2D = op->main_as_Convolution2D();
     bool ldInt8Weight = false;
+#ifdef MNN_LOW_MEMORY
+    auto conv2D = op->main_as_Convolution2D();
     if(static_cast<MetalBackend*>(backend)->getMemoryMode() == BackendConfig::Memory_Low) {
         if (conv2D->quanParameter() && (conv2D->external() || conv2D->quanParameter()->buffer())) {
             // quant type equal to 3 means fp16, fallback to float weight
@@ -72,6 +54,7 @@ MetalConvolution1x1::MetalConvolution1x1(Backend *backend, const MNN::Op *op) : 
             }
         }
     }
+#endif
     loadWeight(op, ldInt8Weight);
 }
 
@@ -96,11 +79,9 @@ bool MetalConvolution1x1::onClone(Backend* bn, const Op* op, Execution** dst) {
         return true;
     }
     if (op->type() == OpType_GatherV2) {
-        // SharedGather path: reuse quantized weight and dequant resources
         auto dequantScale = getDequantScale();
         if (!dequantScale ||
             (mDequantBits != 2 && mDequantBits != 3 && mDequantBits != 4 && mDequantBits != 8)) {
-            // Quantized weight is required for SharedGather
             return false;
         }
         auto conv2D = mOp->main_as_Convolution2D();
@@ -115,9 +96,166 @@ bool MetalConvolution1x1::onClone(Backend* bn, const Op* op, Execution** dst) {
     return true;
 }
 
-bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Tensor* peerOutput) {
-    if (!mIs2sgDecode || !peer->mIs2sgDecode ||
-        mDequantBits != peer->mDequantBits || mBlockSize != peer->mBlockSize) {
+struct Conv1x1GpuTier {
+    bool prefersOc16Sg8K2;
+    bool hasOc8Sg4K2Budget;
+    bool proTier;
+    bool aSeriesM4Gen;
+    bool belowM4Gen;
+};
+
+static Conv1x1GpuTier conv1x1GpuTier(const MetalRuntime* rt) {
+    const MetalGpuInfo& gpu = rt->gpuInfo();
+    const bool baseTier = (gpu.tier == MetalGpuInfo::TierBase);
+    Conv1x1GpuTier t;
+    t.prefersOc16Sg8K2    = baseTier && gpu.gen == 16;
+    t.hasOc8Sg4K2Budget = baseTier && gpu.gen >= 16;
+    t.proTier             = gpu.tier >= MetalGpuInfo::TierPro;
+    t.aSeriesM4Gen        = gpu.gen >= 16 && gpu.aSeries;
+    t.belowM4Gen          = gpu.gen < 16 && !t.proTier;
+    return t;
+}
+
+// Lanes sweeping K inside one quant block; split-K keeps a 2-lane floor
+// unless a single lane already covers its half in one pass.
+static int gemvLanesPerBlock(int inputDepthQuad, int blockCount, bool splitK) {
+    if (blockCount <= 0) {
+        return 0;
+    }
+    const int quadsPerBlock = UP_DIV(inputDepthQuad, blockCount);
+    const int legacyLanes    = std::min(kMetalSimdGroupWidth, std::max(quadsPerBlock / 4, 1));
+    if (!splitK) {
+        return legacyLanes;
+    }
+    const int blocksPerSimdgroup    = std::max(blockCount / 2, 1);
+    const int oneBlockPerLaneGroup  = std::max(kMetalSimdGroupWidth / blocksPerSimdgroup, 1);
+    const int pairLaneGroups        = kMetalSimdGroupWidth / 2;
+    const bool shortSecondPass      = blocksPerSimdgroup <= pairLaneGroups + pairLaneGroups / 2;
+    const int floorLanes            = shortSecondPass ? 1 : 2;
+    const int chosenLanes =
+        std::max(std::min(legacyLanes, oneBlockPerLaneGroup), std::min(legacyLanes, floorLanes));
+    int pow2Lanes = 1;
+    while (pow2Lanes * 2 <= chosenLanes) {
+        pow2Lanes *= 2;
+    }
+    return pow2Lanes;
+}
+
+// Lanes per quant block that minimize idle lane-group slots across a split-K
+// simdgroup's half of the K sweep.
+static int gemvSplitKFillLanes(int blockCount) {
+    const int blocksOwned = std::max(blockCount / 2, 1);
+    int bestLanes = 2;
+    int bestSlots = 0;
+    for (int lanes = 2; lanes <= 4; lanes *= 2) {
+        const int blocksInFlight = kMetalSimdGroupWidth / lanes;
+        const int slots = UP_DIV(blocksOwned, blocksInFlight) * blocksInFlight;
+        if (bestSlots == 0 || slots < bestSlots) {
+            bestSlots = slots;
+            bestLanes = lanes;
+        }
+    }
+    return bestLanes;
+}
+
+// Quant quads of one weight row that share a cache line. A quad carries 4
+// output channels x 4 K elements, i.e. 2 * dequantBits bytes. Rounded down to a
+// power of two (W3: 21 -> 16) so the kernel's lane groups tile the simdgroup.
+static int gemvQuadsPerCacheLine(int dequantBits) {
+    const int quads = std::max(kMetalCacheLineBytes / std::max(2 * dequantBits, 1), 1);
+    int pow2Quads = 1;
+    while (pow2Quads * 2 <= quads) {
+        pow2Quads *= 2;
+    }
+    return pow2Quads;
+}
+
+// Raises lanes until a lane group's run of consecutive quant quads covers a
+// cache line, so weight loads stay on the bandwidth roofline.
+static int gemvCacheLineLanes(int inputDepthQuad, int blockCount, int dequantBits, int lanes) {
+    if (blockCount <= 0 || dequantBits <= 0) {
+        return lanes;
+    }
+    const int quadsPerBlock = UP_DIV(inputDepthQuad, blockCount);
+    const int lineQuads     = gemvQuadsPerCacheLine(dequantBits);
+    if (quadsPerBlock <= lineQuads) {
+        return lanes;
+    }
+    return std::min(kMetalSimdGroupWidth, std::max(lanes, lineQuads));
+}
+
+// Lanes per quant block for the plain (no split-K) 2sg decode GEMV. Returns 0
+// to keep the kernel's own default.
+static int gemvPlainLanesPerBlock(int inputDepthQuad, int blockCount, int dequantBits) {
+    const int defaultLanes = gemvLanesPerBlock(inputDepthQuad, blockCount, /*splitK=*/false);
+    if (defaultLanes <= 0) {
+        return 0;
+    }
+    const int lanes = gemvCacheLineLanes(inputDepthQuad, blockCount, dequantBits, defaultLanes);
+    return lanes == defaultLanes ? 0 : lanes;
+}
+
+// oc16Sg8K2 is only picked when lane-group occupancy stays above ~80% and
+// the K sweep (or weight size) can repay the reduction barrier.
+static bool qkvOc16Sg8K2Admissible(int blockCount, int inputDepthQuad, int totalOutputChannels) {
+    if (blockCount % 2 != 0) {
+        return false;
+    }
+    const int lanesPerBlock = gemvLanesPerBlock(inputDepthQuad, blockCount, /*splitK=*/true);
+    if (lanesPerBlock <= 0) {
+        return false;
+    }
+    const int blocksOwned    = blockCount / 2;
+    const int blocksInFlight = kMetalSimdGroupWidth / lanesPerBlock;
+    const int passes         = UP_DIV(blocksOwned, blocksInFlight);
+    if (blocksOwned * 5 < blocksInFlight * passes * 4) {
+        return false;
+    }
+    constexpr int kMinSplitKQuadsPerSG = 256;
+    if (inputDepthQuad / 2 >= kMinSplitKQuadsPerSG) {
+        return true;
+    }
+    constexpr int kShortKSplitMaxTotalOutputChannels = 4096;
+    return totalOutputChannels <= kShortKSplitMaxTotalOutputChannels;
+}
+
+static void copyTensorBytes(id<MTLBuffer> dst, size_t dstOff, const std::shared_ptr<Tensor>& src, size_t bytes) {
+    auto alloc = (MetalRuntimeAllocator::MetalBufferAlloc *)src->deviceId();
+    memcpy((uint8_t *)dst.contents + dstOff,
+           (uint8_t *)alloc->getBuffer().contents + TensorUtils::getDescribeOrigin(src.get())->offset, bytes);
+}
+
+// SwiGLU K-split factor on top of oc16Sg2K1: picks the widest factor within
+// kMaxPairs whose lanes cover a pair's blocks in one pass, else the narrowest.
+static int gateUpSiluSplitK(int blockCount, int quadsPerBlock) {
+    constexpr int kMaxThreadgroupThreads = 1024;
+    constexpr int kMaxPairs              = 6;
+    const int legacyLanes = std::max(quadsPerBlock / 4, 1);
+    const int minOwned    = std::max(2 * kMetalSimdGroupWidth / std::max(quadsPerBlock, 1), 1);
+    const int maxOwned    = kMetalSimdGroupWidth / legacyLanes;
+    int widest    = 0;
+    int narrowest = 0;
+    for (int factor = 2; factor * 2 * kMetalSimdGroupWidth <= kMaxThreadgroupThreads; ++factor) {
+        if (blockCount % factor != 0) {
+            continue;
+        }
+        const int blocksOwned = blockCount / factor;
+        if (blocksOwned < minOwned || blocksOwned > maxOwned) {
+            continue;
+        }
+        if (narrowest == 0) {
+            narrowest = factor;
+        }
+        if (factor <= kMaxPairs) {
+            widest = factor;
+        }
+    }
+    return widest > 0 ? widest : narrowest;
+}
+
+bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Tensor* peerOutput,
+                                            const Tensor* siluOutput) {
+    if (!mIs2sgDecode || !peer->mIs2sgDecode) {
         return false;
     }
     // Leader = gate (this), Follower = up (peer)
@@ -126,15 +264,14 @@ bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Ten
     mGateUpPeerOutput = peerOutput;
     peer->mIsGateUpFollower = true;
 
-    // Build fused pipeline with GATE_UP_FUSED macro
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
 
-    // Store up's scale_coef separately: gate uses cst.scale_coef (via buffer(2)),
-    // but up needs its own tensor-specific coefficient. Without this, up's dequant
-    // is scaled by gate's coefficient and any range mismatch drifts decode into
-    // garbage on models like Qwen3.5-2B.
-    mGateUpSegBuffer = backend->getConstBuffer(sizeof(float));
+    // up needs its own scaleCoef; gate's comes from cst. Allocated once and
+    // rewritten in place, like mConstBuffer.
+    if (nil == mGateUpSegBuffer) {
+        mGateUpSegBuffer = backend->getConstBuffer(sizeof(float));
+    }
     ((float *)mGateUpSegBuffer.contents)[0] = peer->mScaleCoef;
     MetalRuntime* rt = (MetalRuntime *)backend->runtime();
 
@@ -155,15 +292,51 @@ bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Ten
     keys.emplace_back("conv1x1_wquant_sg_reduce");
     keys.emplace_back("conv1x1_gemv_g4m1_2sg_wquant_sg");
     keys.emplace_back("GATE_UP_FUSED");
-    // Extend the generalized Q4 W16 decode specialization onto the fused GEMV.
-    // Gate and up share the block-input and must compile the same block shape.
-    const bool w16 = mQ4W16BlockSlices > 0 && mQ4W16BlockSlices == peer->mQ4W16BlockSlices &&
-                     mDequantBits == 4;
-    const int w16Mid = w16 ? chooseQ4W16Mid(mBlockSize, mQ4W16BlockSlices / 2) : 0;
-    if (w16) {
-        keys.emplace_back("GEMV_QBLOCK_W16");
-        keys.emplace_back("W16_BLOCK_SLICES_" + std::to_string(mQ4W16BlockSlices));
-        keys.emplace_back("W16_MID_" + std::to_string(w16Mid));
+    // oc16Sg2K1 is forced on devices without tensor-API, and SwiGLU reuses its
+    // body for the gate/up epilogue so it is also forced when mGateUpSilu is on.
+    const bool useOc16Sg2K1 = !backend->isSupportTensorApi();
+    mGateUpSilu = siluOutput != nullptr;
+    mGateUpSiluOutput = mGateUpSilu ? siluOutput : nullptr;
+    const int gateUpDepthQuad = ((Param*)mConstBuffer.contents)->outputDepthQuad;
+    const int peerDepthQuad = ((Param*)peer->mConstBuffer.contents)->outputDepthQuad;
+    const int gateUpQuadsPerBlock = UP_DIV(((Param*)mConstBuffer.contents)->inputDepthQuad, mBlockCount);
+    const bool useOc16Sg4K1 = !useOc16Sg2K1 && !mGateUpSilu && gateUpQuadsPerBlock >= 32 &&
+                              gateUpDepthQuad % 4 == 0 && peerDepthQuad % 4 == 0;
+    mUseOc16Sg4K1 = useOc16Sg4K1;
+    if (useOc16Sg4K1) {
+        keys.emplace_back("oc16Sg4K1");
+    } else if (useOc16Sg2K1 || mGateUpSilu) {
+        keys.emplace_back("oc16Sg2K1");
+    }
+    // Split-K gate: raw channels whole in equal-size quant blocks (any block size)
+    // and 8-wide output pairs, so C4-padded tails stay out.
+    const int gateUpInputChannels = mOp->main_as_Convolution2D()->common()->inputCount();
+    const int gateUpOutputChannels = ((Param*)mConstBuffer.contents)->outputChannel;
+    const Conv1x1GpuTier gpuTier = conv1x1GpuTier(rt);
+    const bool gateUpFactorSkRoute =
+        (gpuTier.hasOc8Sg4K2Budget ||
+         (gpuTier.aSeriesM4Gen && !backend->isSupportTensorApi())) &&
+        backend->useFp16InsteadFp32() && mGateUpSilu &&
+        gateUpOutputChannels % 8 == 0 &&
+        (mDequantBits == 4 || mDequantBits == 8) && peer->mDequantBits == mDequantBits && mBlockCount > 0 &&
+        gateUpInputChannels % mBlockCount == 0 &&
+        peer->mBlockCount == mBlockCount &&
+        peer->mOp->main_as_Convolution2D()->common()->inputCount() == gateUpInputChannels &&
+        ((Param*)peer->mConstBuffer.contents)->outputChannel == gateUpOutputChannels;
+    const int gateUpSkQuadsFloor = (gpuTier.belowM4Gen || gpuTier.proTier) ? 32 : 4;
+    mGateUpSiluKSplit = 0;
+    if (gateUpFactorSkRoute) {
+        mGateUpSiluKSplit = gateUpSiluSplitK(mBlockCount, gateUpQuadsPerBlock);
+    }
+    if (mGateUpSiluKSplit == 0 && mGateUpSilu && (gateUpDepthQuad % 2 == 0) &&
+        gateUpQuadsPerBlock >= gateUpSkQuadsFloor && (mBlockCount & (mBlockCount - 1)) == 0) {
+        mGateUpSiluKSplit = 2;
+    }
+    if (mGateUpSiluKSplit > 0) {
+        keys.emplace_back("oc16Sg2K1_siluK" + std::to_string(mGateUpSiluKSplit));
+    }
+    if (mGateUpSilu) {
+        keys.emplace_back("GATE_UP_SILU");
     }
 
     mGateUpFusedPipeline = rt->findPipeline(keys);
@@ -194,10 +367,16 @@ bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Ten
             [dic setValue:@"1" forKey:@"W_QUANT_8"];
         }
         [dic setValue:@"1" forKey:@"GATE_UP_FUSED"];
-        if (w16) {
-            [dic setValue:@"1" forKey:@"GEMV_QBLOCK_W16"];
-            [dic setValue:@(mQ4W16BlockSlices).stringValue forKey:@"GEMV_QBLOCK_W16_BLOCK_SLICES"];
-            [dic setValue:@(w16Mid).stringValue forKey:@"GEMV_QBLOCK_W16_MID"];
+        if (useOc16Sg4K1) {
+            [dic setValue:@"4" forKey:@"GEMV_QUADS_PER_TG"];
+        } else if (useOc16Sg2K1 || mGateUpSilu) {
+            [dic setValue:@"1" forKey:@"GEMV_SG_OC_QUADS_2"];
+        }
+        if (mGateUpSiluKSplit > 0) {
+            [dic setValue:@(mGateUpSiluKSplit).stringValue forKey:@"GEMV_SG_OC_QUADS_2_KSPLIT"];
+        }
+        if (mGateUpSilu) {
+            [dic setValue:@"1" forKey:@"GATE_UP_SILU"];
         }
         option.preprocessorMacros = dic;
 
@@ -206,36 +385,67 @@ bool MetalConvolution1x1::setupGateUpFusion(MetalConvolution1x1* peer, const Ten
         rt->insertPipeline(keys, mGateUpFusedPipeline);
     }
 
-    if (nil == mGateUpFusedPipeline) {
-        // Compilation failed, revert fusion
+    if (nil == mGateUpFusedPipeline ||
+        (mGateUpSiluKSplit > 0 &&
+         mGateUpFusedPipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(64 * mGateUpSiluKSplit))) {
+        // Compilation failed or the split-K threadgroup does not fit, revert fusion.
+        // mGateUpSegBuffer is kept so its identity stays stable for any live recording.
         mIsGateUpLeader = false;
         mGateUpPeer = nullptr;
-        mGateUpSegBuffer = nil;
+        mGateUpSilu = false;
+        mGateUpSiluOutput = nullptr;
+        mGateUpSiluKSplit = 0;
+        mUseOc16Sg4K1 = false;
         peer->mIsGateUpFollower = false;
         return false;
     }
 
-    // Update grid: add z=2 dimension for gate/up selection. The fused pipeline
-    // is 2sg-kernel based — force 64 threads (plain pipeline may be split-K g8
-    // with a 128-thread group).
+    // Grid adds z=2 for gate/up selection; the fused pipeline is 2sg-kernel based,
+    // so force 64 threads regardless of the plain pipeline's group size.
     auto gridSize = mThreads.first;
-    mThreads.first = MTLSizeMake(gridSize.width, gridSize.height, 2);
-    mThreads.second = MTLSizeMake(64, 1, 1);
+    NSUInteger gw = gridSize.width;
+    NSUInteger gz = 2;
+    int tgThreads = 64;
+    if (useOc16Sg4K1) {
+        gw = (NSUInteger)UP_DIV(ALIMAX(gateUpDepthQuad, peerDepthQuad), 4);
+        tgThreads = 128;
+    } else if (useOc16Sg2K1) {
+        gw = (NSUInteger)UP_DIV(gateUpDepthQuad, 4);
+        if (mGateUpSilu) {
+            // A simdgroup covers one quad of both matrices, so the gate/up split
+            // moves out of z and into x.
+            gw = (NSUInteger)UP_DIV(gateUpDepthQuad, 2);
+            gz = 1;
+        }
+    } else if (mGateUpSilu) {
+        gw = (NSUInteger)UP_DIV(gateUpDepthQuad, 2);
+        gz = 1;
+    }
+    if (mGateUpSiluKSplit > 0) {
+        tgThreads = 64 * mGateUpSiluKSplit;
+    }
+    mThreads.first = MTLSizeMake(gw, gridSize.height, gz);
+    mThreads.second = MTLSizeMake(tgThreads, 1, 1);
 
     return true;
 }
 
-bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tensor* peerKOutput,
+bool MetalConvolution1x1::setupQKVFusion(const Tensor* selfOutput,
+                                         MetalConvolution1x1* peerK, const Tensor* peerKOutput,
                                          MetalConvolution1x1* peerV, const Tensor* peerVOutput,
                                          MetalConvolution1x1* peerW, const Tensor* peerWOutput) {
+    for (auto output : {selfOutput, peerKOutput, peerVOutput, peerWOutput}) {
+        if (output != nullptr && TensorUtils::getDescribe(output)->storageRoot != nullptr) {
+            return false;
+        }
+    }
     if (!mIs2sgDecode || !peerK->mIs2sgDecode || !peerV->mIs2sgDecode) {
         return false;
     }
     if (peerW != nullptr && !peerW->mIs2sgDecode) {
         return false;
     }
-    // No stacking with other fusion roles (buffer indices 6-9/14 collide with
-    // GATE_UP_FUSED; LN_FUSED pipeline would lack the QKV macro).
+    // No stacking with other fusion roles: buffer indices 6-9/14 collide.
     if (mIsGateUpLeader || mIsGateUpFollower || mHasLNFusion ||
         peerK->mIsGateUpLeader || peerK->mIsGateUpFollower || peerK->mHasLNFusion ||
         peerV->mIsGateUpLeader || peerV->mIsGateUpFollower || peerV->mHasLNFusion) {
@@ -245,15 +455,15 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
         (peerW->mIsGateUpLeader || peerW->mIsGateUpFollower || peerW->mHasLNFusion)) {
         return false;
     }
-    // The fused kernel shares the leader's cst for everything except
-    // output_slice and scale_coef, so quant layout and activation must match.
+    // The fused kernel shares the leader's cst except outputDepthQuad and
+    // scaleCoef, so quant layout and activation must match.
     if (peerK->mDequantBits != mDequantBits || peerV->mDequantBits != mDequantBits ||
-        peerK->mBlockSize != mBlockSize || peerV->mBlockSize != mBlockSize ||
+        peerK->mBlockCount != mBlockCount || peerV->mBlockCount != mBlockCount ||
         peerK->mActivationType != mActivationType || peerV->mActivationType != mActivationType) {
         return false;
     }
     if (peerW != nullptr &&
-        (peerW->mDequantBits != mDequantBits || peerW->mBlockSize != mBlockSize ||
+        (peerW->mDequantBits != mDequantBits || peerW->mBlockCount != mBlockCount ||
          peerW->mActivationType != mActivationType)) {
         return false;
     }
@@ -278,27 +488,96 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
     keys.emplace_back("conv1x1_wquant_sg_reduce");
     keys.emplace_back("conv1x1_gemv_g4m1_2sg_wquant_sg");
     keys.emplace_back("QKV_FUSED");
-    // Compact projection grids improve Qwen3.5-2B decode on Mac M5 Pro, but
-    // showed no end-to-end gain on iPad M5. Keep the portable default on the
-    // legacy rectangular grid and make compact mode an explicit opt-in.
-    const bool compactGrid = MetalEnv::get().qkvCompactGridEnabled;
-    if (compactGrid) {
-        keys.emplace_back("QKV_COMPACT_GRID");
-    }
     if (peerW != nullptr) {
         keys.emplace_back("QKV_FUSED_P4");
     }
-    // Generalized Q4 W16 on the fused QKV GEMV. Every member must carry the
-    // same compile-time quant-block shape.
-    const bool w16 = mQ4W16BlockSlices > 0 && mQ4W16BlockSlices == peerK->mQ4W16BlockSlices &&
-                     mQ4W16BlockSlices == peerV->mQ4W16BlockSlices &&
-                     (peerW == nullptr || mQ4W16BlockSlices == peerW->mQ4W16BlockSlices) &&
-                     mDequantBits == 4;
-    const int w16Mid = w16 ? chooseQ4W16Mid(mBlockSize, mQ4W16BlockSlices / 2) : 0;
-    if (w16) {
-        keys.emplace_back("GEMV_QBLOCK_W16");
-        keys.emplace_back("W16_BLOCK_SLICES_" + std::to_string(mQ4W16BlockSlices));
-        keys.emplace_back("W16_MID_" + std::to_string(w16Mid));
+    const int numProj = peerW != nullptr ? 4 : 3;
+    const int projDepthQuad[4] = {
+        ((Param*)mConstBuffer.contents)->outputDepthQuad,
+        ((Param*)peerK->mConstBuffer.contents)->outputDepthQuad,
+        ((Param*)peerV->mConstBuffer.contents)->outputDepthQuad,
+        peerW != nullptr ? ((Param*)peerW->mConstBuffer.contents)->outputDepthQuad : 0,
+    };
+    // Each K half must be a whole number of quant blocks, and no projection may
+    // early-return before the reduction barrier.
+    const bool splitKAllowed = mBlockCount % 2 == 0;
+    const Conv1x1GpuTier gpuTier = conv1x1GpuTier(rt);
+    const int qkvInputChannels = mOp->main_as_Convolution2D()->common()->inputCount();
+    const int qkvInputDepthQuad = ((Param*)mConstBuffer.contents)->inputDepthQuad;
+    const int qkvQuadsPerBlock = UP_DIV(qkvInputDepthQuad, mBlockCount);
+    const bool qkvAllowOc8Sg4K2 = gpuTier.hasOc8Sg4K2Budget && !gpuTier.prefersOc16Sg8K2 &&
+        backend->useFp16InsteadFp32() && splitKAllowed &&
+        (mDequantBits == 4 || mDequantBits == 8) && mBlockCount > 0 && qkvInputChannels % mBlockCount == 0;
+    const int qkvOutputChannels[4] = {
+        ((Param*)mConstBuffer.contents)->outputChannel,
+        ((Param*)peerK->mConstBuffer.contents)->outputChannel,
+        ((Param*)peerV->mConstBuffer.contents)->outputChannel,
+        peerW != nullptr ? ((Param*)peerW->mConstBuffer.contents)->outputChannel : 0,
+    };
+    const bool qkvAllowOc16Sg8K2 = gpuTier.prefersOc16Sg8K2 && backend->useFp16InsteadFp32() &&
+        (mDequantBits == 4 || mDequantBits == 8) && mBlockCount > 0 && qkvInputChannels % mBlockCount == 0;
+    int qkvTotalOutputChannels = 0;
+    for (int p = 0; p < numProj; ++p) {
+        qkvTotalOutputChannels += qkvOutputChannels[p];
+    }
+    const bool proAllowOc16Sg8K2 = gpuTier.proTier && backend->useFp16InsteadFp32() &&
+        (mDequantBits == 4 || mDequantBits == 8) &&
+        qkvOc16Sg8K2Admissible(mBlockCount, ((Param*)mConstBuffer.contents)->inputDepthQuad,
+                               qkvTotalOutputChannels);
+    bool useOc16Sg8K2 = splitKAllowed && ((qkvAllowOc16Sg8K2 && !qkvAllowOc8Sg4K2) || proAllowOc16Sg8K2);
+    for (int p = 0; p < numProj; ++p) {
+        useOc16Sg8K2 = useOc16Sg8K2 && projDepthQuad[p] % 4 == 0;
+    }
+    // oc16Sg2K1 (GEMV_SG_OC_QUADS_2) pairs with the quadsPerTG=4 grid below; dropping
+    // either half leaves half of every projection's rows unwritten.
+    const bool useOc16Sg2K1 = !useOc16Sg8K2 && !backend->isSupportTensorApi();
+    bool useOc16Sg4K1 = !useOc16Sg8K2 && !useOc16Sg2K1 && !qkvAllowOc8Sg4K2 && qkvQuadsPerBlock >= 32;
+    for (int p = 0; p < numProj; ++p) {
+        useOc16Sg4K1 = useOc16Sg4K1 && projDepthQuad[p] % 4 == 0;
+    }
+    // oc8Sg4K2 (plain split-K): 2 quads/TG over 4 simdgroups. Tensor-API only in
+    // practice, since !useOc16Sg8K2 already implies useOc16Sg2K1 otherwise.
+    bool useOc8Sg4K2 = !useOc16Sg8K2 && !useOc16Sg4K1 && !useOc16Sg2K1 && splitKAllowed &&
+                   (qkvAllowOc8Sg4K2 || mBlockCount <= MetalEnv::get().qkvSplitKMaxBlocks);
+    for (int p = 0; p < numProj; ++p) {
+        useOc8Sg4K2 = useOc8Sg4K2 && projDepthQuad[p] % 2 == 0;
+    }
+    mQKVUseOc16Sg2K1 = useOc16Sg2K1;
+    mQKVSplitK = useOc16Sg8K2 || useOc8Sg4K2;
+    mQKVUseOc16Sg8K2 = useOc16Sg8K2;
+    mUseOc16Sg4K1 = useOc16Sg4K1;
+    if (useOc16Sg4K1) {
+        keys.emplace_back("oc16Sg4K1");
+    }
+    if (useOc16Sg2K1) {
+        keys.emplace_back("oc16Sg2K1");
+    }
+    mQKVSkLanesPerBlock = !mQKVSplitK ? 0
+        : gemvLanesPerBlock(qkvInputDepthQuad, mBlockCount, true);
+    const int qkvSkLanesPerBlock = mQKVSkLanesPerBlock;
+    // The grid below and the macro must both come from this one value.
+    const int quadsPerTG = (useOc16Sg2K1 || useOc16Sg8K2 || useOc16Sg4K1) ? 4 : 2;
+    if (mQKVSplitK) {
+        keys.emplace_back(quadsPerTG == 4 ? "oc16Sg8K2" : "oc8Sg4K2");
+        if (qkvSkLanesPerBlock > 0) {
+            keys.emplace_back("lpb" + std::to_string(qkvSkLanesPerBlock));
+        }
+    }
+    // The packed grid is a compile-time variant, so it belongs in the cache key and
+    // the macro dictionary.
+    int projGridX[4] = {0, 0, 0, 0};
+    int packedGridX = 0;
+    int maxGridX = 0;
+    for (int p = 0; p < numProj; ++p) {
+        projGridX[p] = UP_DIV(projDepthQuad[p], quadsPerTG);
+        packedGridX += projGridX[p];
+        maxGridX = ALIMAX(maxGridX, projGridX[p]);
+    }
+    // Packing only differs from the rectangular grid when the members differ in
+    // outputChannel.
+    mQKVPackedGrid = packedGridX < numProj * maxGridX;
+    if (mQKVPackedGrid) {
+        keys.emplace_back("QKV_PACKED_GRID");
     }
 
     mQKVFusedPipeline = rt->findPipeline(keys);
@@ -329,16 +608,23 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
             [dic setValue:@"1" forKey:@"W_QUANT_8"];
         }
         [dic setValue:@"1" forKey:@"QKV_FUSED"];
-        if (compactGrid) {
-            [dic setValue:@"1" forKey:@"QKV_COMPACT_GRID"];
-        }
         if (peerW != nullptr) {
             [dic setValue:@"1" forKey:@"QKV_FUSED_P4"];
         }
-        if (w16) {
-            [dic setValue:@"1" forKey:@"GEMV_QBLOCK_W16"];
-            [dic setValue:@(mQ4W16BlockSlices).stringValue forKey:@"GEMV_QBLOCK_W16_BLOCK_SLICES"];
-            [dic setValue:@(w16Mid).stringValue forKey:@"GEMV_QBLOCK_W16_MID"];
+        if (useOc16Sg2K1) {
+            [dic setValue:@"1" forKey:@"GEMV_SG_OC_QUADS_2"];
+        }
+        if (useOc16Sg4K1) {
+            [dic setValue:@"4" forKey:@"GEMV_QUADS_PER_TG"];
+        } else if (mQKVSplitK) {
+            [dic setValue:@(quadsPerTG).stringValue forKey:@"GEMV_QUADS_PER_TG"];
+            [dic setValue:@"2" forKey:@"GEMV_SPLIT_K"];
+            if (qkvSkLanesPerBlock > 0) {
+                [dic setValue:@(qkvSkLanesPerBlock).stringValue forKey:@"GEMV_LANES_PER_BLOCK"];
+            }
+        }
+        if (mQKVPackedGrid) {
+            [dic setValue:@"1" forKey:@"QKV_PACKED_GRID"];
         }
         option.preprocessorMacros = dic;
 
@@ -347,6 +633,10 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
         rt->insertPipeline(keys, mQKVFusedPipeline);
     }
     if (nil == mQKVFusedPipeline) {
+        mQKVSplitK = false;
+        mQKVUseOc16Sg8K2 = false;
+        mQKVSkLanesPerBlock = 0;
+        mUseOc16Sg4K1 = false;
         return false;
     }
 
@@ -357,37 +647,54 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
     mQKVPeerKOutput = peerKOutput;
     mQKVPeerVOutput = peerVOutput;
     mQKVPeerWOutput = peerWOutput;
-    mQKVCompactGrid = compactGrid;
     peerK->mIsQKVFollower = true;
     peerV->mIsQKVFollower = true;
     if (peerW != nullptr) {
         peerW->mIsQKVFollower = true;
     }
 
-    // The fused dispatch writes k/v outputs at the leader's (earlier) position.
-    // Ops between the leader and the k/v consumers (q/k-norm Cast/Raster, RoPE,
-    // attention in-execution scratch) may share the followers' dynamic-pool
-    // regions — their lifetimes don't overlap in the UNfused schedule — and
-    // would clobber the early writes (observed as decode garbage once KV growth
-    // reshuffled the pool). Re-home both outputs to static memory, which the
-    // dynamic pool can never alias; consumers bind tensor addresses at encode
-    // time and follow automatically. Called after the allocator's compute(), so
-    // the assignment sticks. The few KB of static memory per projection are not
-    // reclaimed on later resizes (decode module resizes once; bounded waste).
-    bool rehomed = backend->onAcquireBuffer(peerKOutput, Backend::STATIC) &&
-                   backend->onAcquireBuffer(peerVOutput, Backend::STATIC);
-    if (rehomed && peerW != nullptr) {
-        rehomed = backend->onAcquireBuffer(peerWOutput, Backend::STATIC);
+    // Followers' outputs must land in static memory: the fused dispatch writes
+    // them at the leader's position, where the dynamic pool may alias them.
+    const Tensor* projOutputs[4] = {selfOutput, peerKOutput, peerVOutput, peerWOutput};
+    size_t mergedOutOff[4] = {0, 0, 0, 0};
+    mQKVMergedOut = false;
+    // One holder keeps every projection reachable from buffer(1) with 16B-aligned starts.
+    size_t total = 0;
+    for (int p = 0; p < numProj; ++p) {
+        mergedOutOff[p] = total;
+        total += backend->getTensorSizeInBytes(projOutputs[p]);
     }
+    if (nullptr == mQKVMergedOutHolder ||
+        backend->getTensorSizeInBytes(mQKVMergedOutHolder.get()) < total) {
+        mQKVMergedOutHolder.reset(Tensor::createDevice<int8_t>({(int)total}));
+        if (!backend->onAcquireBuffer(mQKVMergedOutHolder.get(), Backend::STATIC)) {
+            mQKVMergedOutHolder = nullptr;
+        }
+    }
+    bool rehomed = false;
+    if (nullptr != mQKVMergedOutHolder) {
+        for (int p = 0; p < numProj; ++p) {
+            MetalBackend::aliasTensor(projOutputs[p], mQKVMergedOutHolder.get(), mergedOutOff[p]);
+        }
+        mQKVMergedOut = true;
+        rehomed = true;
+    }
+    // No per-member fallback: the pipeline already writes every projection at the
+    // leader's base, so roll the whole fusion back.
     if (!rehomed) {
         mIsQKVLeader = false;
+        mQKVMergedOut = false;
+        mQKVPackedGrid = false;
+        mQKVSplitK = false;
+        mQKVUseOc16Sg8K2 = false;
+        mQKVSkLanesPerBlock = 0;
+        mUseOc16Sg4K1 = false;
         mQKVPeerK = nullptr;
         mQKVPeerV = nullptr;
         mQKVPeerW = nullptr;
         mQKVPeerKOutput = nullptr;
         mQKVPeerVOutput = nullptr;
         mQKVPeerWOutput = nullptr;
-        mQKVCompactGrid = false;
         peerK->mIsQKVFollower = false;
         peerV->mIsQKVFollower = false;
         if (peerW != nullptr) {
@@ -396,35 +703,83 @@ bool MetalConvolution1x1::setupQKVFusion(MetalConvolution1x1* peerK, const Tenso
         return false;
     }
 
-    // Followers' per-projection scale_coef + output_slice (leader's come from cst).
-    auto kSlice = ((Param*)peerK->mConstBuffer.contents)->output_slice;
-    auto vSlice = ((Param*)peerV->mConstBuffer.contents)->output_slice;
-    auto wSlice = peerW != nullptr ? ((Param*)peerW->mConstBuffer.contents)->output_slice : 0;
-    mQKVSegBuffer = backend->getConstBuffer(6 * sizeof(float));
+    // Followers' scaleCoef + outputDepthQuad and the packed grid bases. Allocated
+    // once and rewritten in place, like mConstBuffer.
+    if (nil == mQKVSegBuffer) {
+        mQKVSegBuffer = backend->getConstBuffer(kQKVSegFloats * sizeof(float));
+    }
     auto seg = (float *)mQKVSegBuffer.contents;
     seg[0] = peerK->mScaleCoef;
     seg[1] = peerV->mScaleCoef;
-    seg[2] = (float)kSlice;
-    seg[3] = (float)vSlice;
+    seg[2] = (float)projDepthQuad[1];
+    seg[3] = (float)projDepthQuad[2];
     seg[4] = peerW != nullptr ? peerW->mScaleCoef : 0.0f;
-    seg[5] = (float)wSlice;
+    seg[5] = (float)projDepthQuad[3];
+    // seg[6..8]: packed-grid base of projections 1..3.
+    seg[6] = (float)projGridX[0];
+    seg[7] = (float)(projGridX[0] + projGridX[1]);
+    seg[8] = (float)(projGridX[0] + projGridX[1] + projGridX[2]);
 
-    // Compact mode concatenates each projection's exact threadgroup range on
-    // grid.x. The shader maps the flat index back to projection + local row.
-    // The rollback path retains the legacy max-grid.x x projection-count
-    // rectangle. Fused pipeline is 2sg-kernel based — force 64 threads (plain
-    // pipeline may be split-K g8 with a 128-thread group).
-    auto leaderSlice = ((Param*)mConstBuffer.contents)->output_slice;
-    if (compactGrid) {
-        NSUInteger compactGridX = (NSUInteger)(UP_DIV(leaderSlice, 2) + UP_DIV(kSlice, 2) +
-                                                UP_DIV(vSlice, 2) + UP_DIV(wSlice, 2));
-        mThreads.first = MTLSizeMake(compactGridX, mThreads.first.height, 1);
+    // Merge q/k/v weights + dequant scales into one buffer to cut the concurrent
+    // DRAM streams. W4 only, and 4-member groups are excluded.
+    const bool doMerge = mDequantBits == 4 && peerW == nullptr;
+    mQKVMergedCount = 0;
+    if (doMerge) {
+        const int nm = peerW == nullptr ? 3 : 4;
+        const std::shared_ptr<Tensor> wt[4] = {mWeight, peerK->getWeight(), peerV->getWeight(),
+                                              peerW != nullptr ? peerW->getWeight() : nullptr};
+        const std::shared_ptr<Tensor> st[4] = {getDequantScale(), peerK->getDequantScale(), peerV->getDequantScale(),
+                                              peerW != nullptr ? peerW->getDequantScale() : nullptr};
+        size_t bytes[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        size_t off = 0;
+        for (int p = 0; p < nm; ++p) {
+            bytes[p]     = TensorUtils::getRawSize(wt[p].get()) * wt[p]->getType().bytes();
+            bytes[4 + p] = TensorUtils::getRawSize(st[p].get()) * st[p]->getType().bytes();
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (bytes[i] == 0) {
+                continue;
+            }
+            off = (off + 15) & ~(size_t)15;
+            mQKVMergedOff[i] = off;
+            off += bytes[i];
+        }
+        if (nil == mQKVMergedBuffer || mQKVMergedSize < off) {
+            auto ctx = (__bridge MNNMetalContext *)backend->context();
+            mQKVMergedBuffer = [ctx.device newBufferWithLength:off options:MTLResourceStorageModeShared];
+            mQKVMergedSize = off;
+        }
+        for (int p = 0; p < nm; ++p) {
+            copyTensorBytes(mQKVMergedBuffer, mQKVMergedOff[p], wt[p], bytes[p]);
+            copyTensorBytes(mQKVMergedBuffer, mQKVMergedOff[4 + p], st[p], bytes[4 + p]);
+        }
+        mQKVMergedCount = nm;
     } else {
-        auto maxSlice = ALIMAX(ALIMAX(leaderSlice, wSlice), ALIMAX(kSlice, vSlice));
-        NSUInteger maxGridX = (NSUInteger)UP_DIV(maxSlice, 2);
-        mThreads.first = MTLSizeMake(maxGridX, mThreads.first.height, peerW != nullptr ? 4 : 3);
+        mQKVMergedBuffer = nil;
     }
-    mThreads.second = MTLSizeMake(64, 1, 1);
+
+    // seg[9..12]: each projection's output offset inside the merged allocation, in
+    // the ftype4 units the shader's `out` is typed with.
+    for (int p = 0; p < 4; ++p) {
+        seg[9 + p] = 0.0f;
+    }
+    if (mQKVMergedOut) {
+        const size_t outElem = backend->useFp16InsteadFp32() ? 8 : 16;
+        for (int p = 0; p < numProj; ++p) {
+            seg[9 + p] = (float)(mergedOutOff[p] / outElem);
+        }
+    }
+
+    if (mQKVPackedGrid) {
+        // x runs over the projections' threadgroup ranges laid end to end.
+        mThreads.first = MTLSizeMake((NSUInteger)packedGridX, mThreads.first.height, 1);
+    } else {
+        // grid.x covers the largest projection; z selects the projection, and
+        // out-of-range simdgroups early-return in the shader.
+        mThreads.first = MTLSizeMake((NSUInteger)maxGridX, mThreads.first.height, numProj);
+    }
+    const int tgSimds = useOc16Sg2K1 ? 2 : quadsPerTG * (mQKVSplitK ? 2 : 1);
+    mThreads.second = MTLSizeMake(32 * tgSimds, 1, 1);
 
     return true;
 }
@@ -443,7 +798,10 @@ bool MetalConvolution1x1::setupLNFusion(const Tensor* hiddenInput, const Tensor*
 
     auto backend = static_cast<MetalBackend *>(this->backend());
     MetalRuntime* rt = (MetalRuntime *)backend->runtime();
-    mLNEpsBuffer = backend->getConstBuffer(sizeof(float));
+    // Allocated once and rewritten in place, like mConstBuffer.
+    if (nil == mLNEpsBuffer) {
+        mLNEpsBuffer = backend->getConstBuffer(sizeof(float));
+    }
     *((float *)mLNEpsBuffer.contents) = eps;
 
     std::string ftype = backend->useFp16InsteadFp32() ? "half" : "float";
@@ -467,38 +825,50 @@ bool MetalConvolution1x1::setupLNFusion(const Tensor* hiddenInput, const Tensor*
     }
     keys.emplace_back("conv1x1_wquant_sg_reduce");
     keys.emplace_back("conv1x1_gemv_g4m1_2sg_wquant_sg");
+    // Macros below must match what setupGateUpFusion/setupQKVFusion sized the grid for.
     if (mIsGateUpLeader) {
         keys.emplace_back("GATE_UP_FUSED");
+        if (mGateUpSilu) {
+            keys.emplace_back("GATE_UP_SILU");
+        }
     }
     if (mIsQKVLeader) {
         keys.emplace_back("QKV_FUSED");
-        if (mQKVCompactGrid) {
-            keys.emplace_back("QKV_COMPACT_GRID");
-        }
         if (mQKVPeerW != nullptr) {
             keys.emplace_back("QKV_FUSED_P4");
         }
-    }
-    keys.emplace_back("LN_FUSED");
-    // Generalized Q4 W16 on the LN-folded fused GEMV. Every fused member must
-    // carry the same compile-time quant-block shape.
-    bool w16 = mQ4W16BlockSlices > 0 && mDequantBits == 4;
-    if (mIsGateUpLeader &&
-        (mGateUpPeer == nullptr || mGateUpPeer->mQ4W16BlockSlices != mQ4W16BlockSlices)) {
-        w16 = false;
-    }
-    if (mIsQKVLeader) {
-        if (mQKVPeerK == nullptr || mQKVPeerK->mQ4W16BlockSlices != mQ4W16BlockSlices ||
-            mQKVPeerV == nullptr || mQKVPeerV->mQ4W16BlockSlices != mQ4W16BlockSlices ||
-            (mQKVPeerW != nullptr && mQKVPeerW->mQ4W16BlockSlices != mQ4W16BlockSlices)) {
-            w16 = false;
+        if (mQKVPackedGrid) {
+            keys.emplace_back("QKV_PACKED_GRID");
         }
     }
-    const int w16Mid = w16 ? chooseQ4W16Mid(mBlockSize, mQ4W16BlockSlices / 2) : 0;
-    if (w16) {
-        keys.emplace_back("GEMV_QBLOCK_W16");
-        keys.emplace_back("W16_BLOCK_SLICES_" + std::to_string(mQ4W16BlockSlices));
-        keys.emplace_back("W16_MID_" + std::to_string(w16Mid));
+    keys.emplace_back("LN_FUSED");
+    const bool useOc16Sg2K1 = mIsQKVLeader ? mQKVUseOc16Sg2K1 : !backend->isSupportTensorApi();
+    const bool qkvSplitK = mIsQKVLeader && mQKVSplitK;
+    const bool useOc16Sg8K2 = mIsQKVLeader && mQKVUseOc16Sg8K2;
+    const int lnStageQuads = UP_DIV(hiddenInput->channel(), 4);
+    // lnStageFits is the threadgroup memory ceiling (float4 worst case);
+    // lnStageWorth is the narrower range staging was tuned for.
+    const bool lnStageFits  = lnStageQuads * 16 <= 8192;
+    const bool lnStageWorth = lnStageQuads * 16 <= 4096;
+    const bool lnStage = useOc16Sg8K2 && lnStageFits && lnStageWorth;
+    if (lnStage) {
+        keys.emplace_back("LN_STAGE_" + std::to_string(lnStageQuads));
+    }
+    if (useOc16Sg2K1 || mGateUpSilu) {
+        keys.emplace_back("oc16Sg2K1");
+    }
+    if (mUseOc16Sg4K1) {
+        keys.emplace_back("oc16Sg4K1");
+    }
+    if (mGateUpSiluKSplit > 0) {
+        keys.emplace_back("oc16Sg2K1_siluK" + std::to_string(mGateUpSiluKSplit));
+    }
+    const int qkvSkLanesPerBlock = qkvSplitK ? mQKVSkLanesPerBlock : 0;
+    if (qkvSplitK) {
+        keys.emplace_back(useOc16Sg8K2 ? "oc16Sg8K2" : "oc8Sg4K2");
+        if (qkvSkLanesPerBlock > 0) {
+            keys.emplace_back("lpb" + std::to_string(qkvSkLanesPerBlock));
+        }
     }
 
     mLNFusedPipeline = rt->findPipeline(keys);
@@ -525,21 +895,38 @@ bool MetalConvolution1x1::setupLNFusion(const Tensor* hiddenInput, const Tensor*
         }
         if (mIsGateUpLeader) {
             [dic setValue:@"1" forKey:@"GATE_UP_FUSED"];
+            if (mGateUpSilu) {
+                [dic setValue:@"1" forKey:@"GATE_UP_SILU"];
+            }
         }
         if (mIsQKVLeader) {
             [dic setValue:@"1" forKey:@"QKV_FUSED"];
-            if (mQKVCompactGrid) {
-                [dic setValue:@"1" forKey:@"QKV_COMPACT_GRID"];
-            }
             if (mQKVPeerW != nullptr) {
                 [dic setValue:@"1" forKey:@"QKV_FUSED_P4"];
             }
+            if (mQKVPackedGrid) {
+                [dic setValue:@"1" forKey:@"QKV_PACKED_GRID"];
+            }
         }
         [dic setValue:@"1" forKey:@"LN_FUSED"];
-        if (w16) {
-            [dic setValue:@"1" forKey:@"GEMV_QBLOCK_W16"];
-            [dic setValue:@(mQ4W16BlockSlices).stringValue forKey:@"GEMV_QBLOCK_W16_BLOCK_SLICES"];
-            [dic setValue:@(w16Mid).stringValue forKey:@"GEMV_QBLOCK_W16_MID"];
+        if (lnStage) {
+            [dic setValue:@"1" forKey:@"LN_STAGE"];
+            [dic setValue:@(lnStageQuads).stringValue forKey:@"LN_STAGE_QUADS"];
+        }
+        if (mUseOc16Sg4K1) {
+            [dic setValue:@"4" forKey:@"GEMV_QUADS_PER_TG"];
+        } else if (useOc16Sg2K1 || mGateUpSilu) {
+            [dic setValue:@"1" forKey:@"GEMV_SG_OC_QUADS_2"];
+        }
+        if (mGateUpSiluKSplit > 0) {
+            [dic setValue:@(mGateUpSiluKSplit).stringValue forKey:@"GEMV_SG_OC_QUADS_2_KSPLIT"];
+        }
+        if (qkvSplitK) {
+            [dic setValue:(useOc16Sg8K2 ? @"4" : @"2") forKey:@"GEMV_QUADS_PER_TG"];
+            [dic setValue:@"2" forKey:@"GEMV_SPLIT_K"];
+            if (qkvSkLanesPerBlock > 0) {
+                [dic setValue:@(qkvSkLanesPerBlock).stringValue forKey:@"GEMV_LANES_PER_BLOCK"];
+            }
         }
         option.preprocessorMacros = dic;
 
@@ -548,14 +935,25 @@ bool MetalConvolution1x1::setupLNFusion(const Tensor* hiddenInput, const Tensor*
         rt->insertPipeline(keys, mLNFusedPipeline);
     }
 
-    if (nil == mLNFusedPipeline) {
+    if (nil == mLNFusedPipeline ||
+        (mGateUpSiluKSplit > 0 &&
+         mLNFusedPipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(64 * mGateUpSiluKSplit))) {
         mHasLNFusion = false;
         return false;
     }
-    // LN-fused pipeline is 2sg-kernel based — force 64 threads (the plain
-    // sole-consumer path dispatches mLNFusedPipeline with mThreads, which may
-    // be split-K g8's 128-thread group).
-    mThreads.second = MTLSizeMake(64, 1, 1);
+    // LN-fused pipeline is 2sg-kernel based, so force 64 threads and widen it for
+    // the split-K variants.
+    NSUInteger lnThreads = 64;
+    if (mGateUpSiluKSplit > 0) {
+        lnThreads = 64 * mGateUpSiluKSplit;
+    } else if (mUseOc16Sg4K1) {
+        lnThreads = 128;
+    } else if (useOc16Sg8K2) {
+        lnThreads = 256;
+    } else if (qkvSplitK) {
+        lnThreads = 128;
+    }
+    mThreads.second = MTLSizeMake(lnThreads, 1, 1);
     return true;
 }
 
@@ -569,15 +967,15 @@ void MetalConvolution1x1::bindLNBuffers(id<MTLComputeCommandEncoder> encoder) {
 ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     MetalConvolutionCommon::onResize(inputs, outputs);
 
-    mQ4W16BlockSlices = 0;
-
-    // Reset Gate/Up fusion state on each resize
+    // Reset fusion state on each resize; const buffers (mGateUpSegBuffer /
+    // mQKVSegBuffer / mLNEpsBuffer) stay alive so recordings keep seeing them.
     mIs2sgDecode = false;
     mIsGateUpLeader = false;
     mIsGateUpFollower = false;
     mGateUpPeer = nullptr;
     mGateUpFusedPipeline = nil;
-    mGateUpSegBuffer = nil;
+    mGateUpSilu = false;
+    mGateUpSiluOutput = nullptr;
 
     // Reset QKV fusion state on each resize
     mIsQKVLeader = false;
@@ -589,8 +987,8 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
     mQKVPeerVOutput = nullptr;
     mQKVPeerWOutput = nullptr;
     mQKVFusedPipeline = nil;
-    mQKVSegBuffer = nil;
-    mQKVCompactGrid = false;
+    mQKVPackedGrid = false;
+    mUseOc16Sg4K1 = false;
 
 
     mHasLNFusion = false;
@@ -599,7 +997,6 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
     mLNResidualInput = nullptr;
     mLNResidualOutput = nullptr;
     mLNGamma = nullptr;
-    mLNEpsBuffer = nil;
 
     // prepare
     // For C4NHW4 format, NHW can be fuse to W
@@ -610,39 +1007,42 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
         is *= input->length(i);
     }
     int ic  = input->channel();
-    int ic_4  = UP_DIV(input->channel(), 4);
+    int icDiv4  = UP_DIV(input->channel(), 4);
     int ow  = is;
     int oh  = 1;
     int os  = ow;
     int ob  = 1;
     auto oc  = output->channel();
-    auto oc_4  = UP_DIV(output->channel(), 4);
+    auto ocDiv4  = UP_DIV(output->channel(), 4);
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
     auto dequantScale = getDequantScale();
-    int blockSize = 1;
+    int blockCount = 1;
     if (dequantScale) {
         int bytes = sizeof(float);
         if(backend->useFp16InsteadFp32()) {
             bytes = sizeof(__fp16);
         }
-        blockSize = (int)(dequantScale->usize() / bytes / oc_4 / 2 / 4);
+        blockCount = (int)(dequantScale->usize() / bytes / ocDiv4 / 2 / 4);
     }
-    // create const buffer
-    mConstBuffer = backend->getConstBuffer(sizeof(Param));
+    // Allocate once and rewrite in place: this buffer is bound raw, so encode-replay
+    // cannot see a swap and a live recording would keep emitting the previous Param.
+    if (nil == mConstBuffer) {
+        mConstBuffer = backend->getConstBuffer(sizeof(Param));
+    }
     auto param = (Param *)mConstBuffer.contents;
-    param->input_size = is;
-    param->input_slice = ic_4;
-    param->output_width = ow;
-    param->output_height = oh;
-    param->output_size = os;
-    param->output_slice = oc_4;
-    param->output_channel = oc;
+    param->inputSize = is;
+    param->inputDepthQuad = icDiv4;
+    param->outputWidth = ow;
+    param->outputHeight = oh;
+    param->outputSize = os;
+    param->outputDepthQuad = ocDiv4;
+    param->outputChannel = oc;
     param->batch = ob;
-    param->block_size = blockSize;
+    param->blockCount = blockCount;
     param->activation = mActivationType;
-    param->scale_coef = mScaleCoef;
-    mBlockSize = blockSize;
+    param->scaleCoef = mScaleCoef;
+    mBlockCount = blockCount;
     int area = ob * ow * oh;
     // basic marco info
     std::string ftype = "float";
@@ -674,72 +1074,41 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
     MetalRuntime* rt = (MetalRuntime *)backend->runtime();
     std::string basicShaderPrefix = gBasicConvPrefix;
 
-    // if M is small, dequant weight in shader
-    // if device not support simdgroup matrix, only support dequant in shader
+    // Tile kernels step whole K-quad groups inside a quant block: 2 for the 8x16/32x16/16x32
+    // wquant tiles, 4 for the outer dequant pre-pass, 8 (32 K) for 16x16/32x64 and fused Q4.
+    const int quadsPerBlock = UP_DIV(icDiv4, blockCount);
+    auto blockFitsQuads = [blockCount, quadsPerBlock](int quads) {
+        return blockCount <= 1 || quadsPerBlock % quads == 0;
+    };
+    // The outer-dequant sg_matrix M=64 fp tile has no per-block loop.
+    const bool outerSgM64 = !backend->isSupportTensorApi() && rt->supportSimdGroupMatrix() && area >= 128;
+
+    // Small M or no simdgroup matrix: dequant in shader.
     bool dequantInShader = (area < 64) || !(rt->supportSimdGroupMatrix());
-    // Decode (area==1) has native W_QUANT_2/3 paths in the GEMV kernels (2sg, and
-    // g16 for lm_head). The multi-token in-shader kernels (g4mN / sg-matrix gemm)
-    // have no true W2/3 branches, so for prefill we route through the outer-dequant
-    // + fp gemm path instead, which has a real W_QUANT_2/3 dequant in
-    // conv1x1_w_dequant. The outer-dequant path itself uses simdgroup-matrix; only
-    // override when the device supports it, otherwise stay on the in-shader path
-    // (g8/g16 cover all areas in-shader there).
+    // Multi-token in-shader kernels lack W2/3 paths; prefill goes through
+    // outer-dequant + fp gemm when simdgroup matrix is available.
     if ((mDequantBits == 2 || mDequantBits == 3) && area > 1 && rt->supportSimdGroupMatrix()) {
         dequantInShader = false;
     }
-    // Tensor API vs in-shader sg_matrix path for prefill (area > 1) with Q4/Q8.
-    //
-    // Default on M5+ (tensor API devices): route to outer-dequant + tensor API
-    // GEMM (conv1x1_gemm_32x64_split_k_sg with USE_METAL_TENSOR_OPS).
-    //
-    // Measurement (M5, Qwen3-4B pp512, W4-block32, fp16, 4 threads):
-    //   default (tensor API):  698 tok/s
-    //   forced in-shader:      361 tok/s  (-48% — massive regression)
-    //   llama.cpp Q4_0:       1039 tok/s (MNN gap: 33% behind)
-    //
-    // Tested the in-shader sg_matrix route on M5 and it
-    // regresses catastrophically because the in-shader Q4 sg_matrix kernels
-    // (conv1x1_gemm_32x16_wquant_sg / 16x32_wquant_sg / 32x64_wquant_split_k_sg)
-    // do NOT use tensor API — they're pure SIMD-matrix. For pp512-scale
-    // workloads on M5 the tensor API path is still faster, just not as fast
-    // as llama.cpp's Metal kernels.
-    //
-    // The real gap vs llama.cpp is inside conv1x1_gemm_32x64_split_k_sg's
-    // tensor API path — reproducing llama.cpp's efficiency requires kernel-
-    // level changes (better matmul2d tiling, weight prefetching, etc.), not
-    // dispatcher-level rerouting.
-    //
+    // Tensor-API devices run Q4/Q8 prefill through outer-dequant + tensor GEMM.
     if (backend->isSupportTensorApi() && area > 1 && (mDequantBits == 4 || mDequantBits == 8)) {
-        // On tensor-API devices (M5+) always force outer-dequant + tensor API.
         dequantInShader = false;
     }
-    // On non-tensor-API devices (M4 and below), choose in-shader vs outer-dequant
-    // based on weight size AND prompt length. In-shader dequant re-unpacks the Q4
-    // weights once per M-tile (unpack count ~ area/32), so it only wins for large
-    // weights at short area; outer-dequant pays a fixed double-pass instead.
-    // M4 calibration (EXP11, Qwen3-4B): pp256 in-shader +1.2%, pp512 parity,
-    // pp768 outdeq +2.4%, pp2048 outdeq +5.3%; Qwen3.5-2B pp2048 outdeq +3.0%.
-    // ⚠️ M3 has a regression precedent with this heuristic — re-validate there
-    // before relying on the 512 boundary outside M4.
-    // Env MNN_METAL_PREFILL_INSHADER_DEQUANT_SGMATRIX=1 forces on, =0 forces off.
+    // In-shader dequant re-unpacks weights per M-tile; only wins for large
+    // weights at short area on non-tensor-API devices.
     if (!backend->isSupportTensorApi() && rt->supportSimdGroupMatrix() && area > 1 &&
         (mDequantBits == 4 || mDequantBits == 8)) {
-        const int kForceInShader = MetalEnv::get().prefillInshaderDequant;
-        if (kForceInShader == 1) {
-            dequantInShader = true;
-        } else if (kForceInShader == -1) {
-            dequantInShader = false;
-        } else if ((size_t)ic * oc > 4 * 1024 * 1024 && area < 512) {
+        if ((size_t)ic * oc > 4 * 1024 * 1024 && area < 512) {
             dequantInShader = true;
         }
     }
+    if (!blockFitsQuads(outerSgM64 ? 4 : 8)) {
+        dequantInShader = true;
+    }
     mPreDequantWeight = false;
-    mUseFusedDecode = false;
 
 #ifdef MNN_LOW_MEMORY
     if (dequantScale && dequantInShader) {
-        //printf("inner dequant MNK: %d %d %d %d\n", area, oc, ic, blockSize);
-
         std::string sgmWqShader  = gConv1x1WqSgMatrix;
         std::string sgrWqShader  = gConv1x1WqSgReduce;
 
@@ -753,32 +1122,25 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
         } else if(mDequantBits == 8) {
             [dic setValue:@"1" forKey:@"W_QUANT_8"];
         }
-        // Q4 block 32/64/128/256 decode specialization for the standalone GEMV
-        // kernels. The C4 slices per quant block become a compile-time constant
-        // (8/16/32/64), enabling 16-byte weight reads without tail checks.
-        int q4W16BlockSlices = 0;
-        if (area == 1 && mDequantBits == 4 && blockSize > 0 && ic_4 % blockSize == 0) {
-            const int candidate = ic_4 / blockSize;
-            if (isQ4W16BlockSlices(candidate)) {
-                q4W16BlockSlices = candidate;
-            }
-        }
-        const bool q4W16 = q4W16BlockSlices > 0;
-        // Record the layout so a fusion leader can extend W16 onto the fused
-        // decode-GEMV pipeline built later in setup{QKV,GateUp,LN}Fusion.
-        mQ4W16BlockSlices = q4W16BlockSlices;
-        if (q4W16) {
-            [dic setValue:@"1" forKey:@"GEMV_QBLOCK_W16"];
-            [dic setValue:@(q4W16BlockSlices).stringValue forKey:@"GEMV_QBLOCK_W16_BLOCK_SLICES"];
-            // Non-split-K pipelines: the simdgroup owns every block of the row.
-            [dic setValue:@(chooseQ4W16Mid(blockSize, q4W16BlockSlices / 2)).stringValue
-                   forKey:@"GEMV_QBLOCK_W16_MID"];
-            [dic setValue:@"1" forKey:@"GEMV_QBLOCK_W16_LMHEAD"];
-        }
+        const Conv1x1GpuTier gpuTier = conv1x1GpuTier(rt);
+        const int rawIc = mOp->main_as_Convolution2D()->common()->inputCount();
+        // Raw channels divide evenly into quant blocks, so none straddle the
+        // C4-padded tail; required by the tuned decode GEMV route.
+        const bool wqEvenBlockFp16 = backend->useFp16InsteadFp32() &&
+            (mDequantBits == 4 || mDequantBits == 8) &&
+            blockCount > 0 && rawIc % blockCount == 0;
+        // Threadgroup budget the decode GEMV grid is compared against (area==1).
+        const int tgBudget = gpuTier.proTier ? 160 : (gpuTier.hasOc8Sg4K2Budget ? 80 : 0);
+        // Decode keeps lm_head on the 2sg route; split-K g16 is prefill-only.
+        const int lmheadSplitKMode = area != 1 ? 2 : 1;
+        // Vocabulary-sized outputs that may take the g16 lm_head kernels.
+        const bool lmHeadScale = oc > 16384;
+        const bool g16LmHeadRoute = lmHeadScale && ocDiv4 % 2 == 0 &&
+                                    !(lmheadSplitKMode == 1 && (oc % 8 == 0) && (blockCount % 2 == 0));
         option.preprocessorMacros = dic;
 
         NSUInteger gid_x = UP_DIV(ow * oh, 4);
-        NSUInteger gid_y = oc_4;
+        NSUInteger gid_y = ocDiv4;
         NSUInteger gid_z = ob;
         std::string name = "conv1x1_g1z4_w8";
         mPipeline = [context pipelineWithName:@"conv1x1_g1z4_w8" fp16:backend->useFp16InsteadFp32()];
@@ -796,28 +1158,23 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             } else if(mDequantBits == 8) {
                 baseKeys.emplace_back("conv1x1_wquant_8");
             }
-            if (q4W16) {
-                baseKeys.emplace_back("GEMV_QBLOCK_W16");
-                baseKeys.emplace_back("W16_BLOCK_SLICES_" + std::to_string(q4W16BlockSlices));
-                baseKeys.emplace_back("W16_MID_" +
-                                      std::to_string(chooseQ4W16Mid(blockSize, q4W16BlockSlices / 2)));
-                baseKeys.emplace_back("GEMV_QBLOCK_W16_LMHEAD");
-            }
-            // W_QUANT_2/3 on non-simdgroup-matrix devices: the outer-dequant GEMM
-            // (sg-matrix based) and the g1z4 fallback below are both unusable, so
-            // g8/g16 must cover all areas in-shader, not just area <= short_seq.
-            const bool w23NoMatrix = (mDequantBits == 2 || mDequantBits == 3) && !rt->supportSimdGroupMatrix();
-            if(rt->supportSimdGroupReduce() && (area <= short_seq || w23NoMatrix)) {
+            // The in-shader tile GEMMs lack W2/3 and need an even quad count per quant
+            // block, so those shapes take g8/g16 at every area.
+            const bool gemvAllArea = mDequantBits == 2 || mDequantBits == 3 ||
+                                     (rt->supportSimdGroupMatrix() && !blockFitsQuads(2));
+            if(rt->supportSimdGroupReduce() && (area <= short_seq || gemvAllArea)) {
                 baseKeys.emplace_back("conv1x1_wquant_sg_reduce");
 
                 std::string sgrWqStr = basicShaderPrefix + sgrWqShader;
-                // g4mN kernels now have true W_QUANT_2/3 branches.
-                if(area > 1 && (mDequantBits == 2 || mDequantBits == 3 || mDequantBits == 4 || mDequantBits == 8)) {
+                // memory bound not so seriously, can add more thread to reduce computation in each thread
+                float ratio = 1.0 * icDiv4 / 2048.0 * oc / 2048.0;
+                bool heavyMemory = ratio > 1.0;
+                // g4mN instantiations only exist up to g4m16; larger areas fall
+                // through to the all-area g8 kernel.
+                const bool g4mNUsable = area <= 16 || (!heavyMemory && area <= 32);
+                if(area > 1 && g4mNUsable) {
                     auto keys = baseKeys;
                     int piece = 1;
-                    // memory bound not so seriously, can add more thread to reduce computation in each thread
-                    float ratio = 1.0 * ic_4 / 2048.0 * oc / 2048.0;
-                    bool heavyMemory = ratio > 1.0;
                     if(area > 5 && !heavyMemory) {
                         if(area % 2 != 0) {
                             keys.emplace_back("MNN_METAL_SRC_PROTECT");
@@ -827,7 +1184,6 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                         area = UP_DIV(area, 2);
                         piece = 2;
                     }
-//                    MNN_PRINT("Conv1x1 Oc:%d Ic:%d\n", oc, ic_4*4);
                     std::string kernel_name = "conv1x1_gemv_g4m" + std::to_string(area) + "_wquant_sg";
                     keys.emplace_back(kernel_name);
                     auto pipeline = rt->findPipeline(keys);
@@ -837,12 +1193,8 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                     }
                     mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
                     mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 4), piece, 1), MTLSizeMake(32, 1, 1));
-                } else if(oc > 16384 && oc_4 % 2 == 0) {
-                    // lm_head path. Baseline g16 = 2 simdgroups per TG,
-                    // threadgroup size 64, each TG covers 16 OC (2 SG x 8 OC/SG).
-                    // Variants explored and retired (see skills/metal-optimize):
-                    // 4SG (halved grid) — e2e neutral with 7x worse stddev on M5;
-                    // G16_OC4 (4 oc_4 rows/SG) — kernel -4.8% on M5 but e2e neutral.
+                } else if(g16LmHeadRoute) {
+                    // lm_head path: g16 = 2 simdgroups per TG, 64 threads, 16 OC per TG.
                     auto keys = baseKeys;
                     keys.emplace_back("conv1x1_gemv_g16_wquant_sg");
                     auto pipeline = rt->findPipeline(keys);
@@ -854,62 +1206,94 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                     mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 16), area, 1),
                                               MTLSizeMake(64, 1, 1));
                 } else if(area == 1) {
-                    // Decode GEMV. Per-kernel bandwidth profiling (M4 Pro,
-                    // Qwen3-0.6B Q4) showed the 2sg kernel is latency-limited on
-                    // small projections: one simdgroup streams a whole row, so
-                    // 0.5-1.8MB matrices reach only 88-137 GB/s while the 87MB
-                    // lm_head (g16 path) hits 252 GB/s. SPLIT_K_2 keeps the same
-                    // pre-scaling inner loop but runs 4 simdgroups per
-                    // threadgroup — two K-halves per row combined via threadgroup
-                    // memory — doubling in-flight reads per row.
-                    // (Routing to the g8 kernel instead was tried first: its
-                    // nibble-unpack inner loop is slower and lost 5% e2e.)
-                    // MNN_METAL_GEMV_SPLITK=0 restores the legacy 2sg kernel.
-                    //
-                    // Legacy 2sg lane partitioning notes (WIDE_MIDDLE knob, M5
-                    // regression) kept in the shader comment block.
-                    const int sSplitK = MetalEnv::get().gemvSplitK;
-                    const bool splitkUsable = (oc % 8 == 0) && (blockSize % 2 == 0);
-                    if (sSplitK > 0 && splitkUsable) {
+                    // Pick between oc16Sg4K1 (whole K) and oc8Sg4K2 (split-K, 2x grid):
+                    // split-K while its grid fits the TG budget, else fall back.
+                    const bool oc16Sg4K1Window = quadsPerBlock >= 32 && quadsPerBlock < 96;
+                    const bool tgBudgetRoute = tgBudget > 0 && wqEvenBlockFp16 && quadsPerBlock >= 32 &&
+                        oc % 16 == 0;
+                    const bool proTgBudgetRoute = tgBudgetRoute && gpuTier.proTier;
+                    const int oc16Sg4K1Threadgroups = oc / 16;
+                    const bool oc8Sg4K2FitsBudget = tgBudgetRoute && 2 * oc16Sg4K1Threadgroups <= tgBudget;
+                    const int oc16Sg4K1GridLimit = gpuTier.proTier ? 2 * tgBudget : tgBudget;
+                    const bool oc16Sg4K1ExceedsLimit = tgBudgetRoute && oc16Sg4K1Threadgroups > oc16Sg4K1GridLimit;
+                    bool useOc8Sg4K2 = oc % 8 == 0 && blockCount % 2 == 0 &&
+                        (oc8Sg4K2FitsBudget || oc16Sg4K1ExceedsLimit || (!oc16Sg4K1Window && !proTgBudgetRoute));
+                    if (gpuTier.belowM4Gen && oc % 16 == 0 && quadsPerBlock <= 96) {
+                        useOc8Sg4K2 = false;
+                    }
+                    if (useOc8Sg4K2) {
+                        int lanesPerBlock = gemvLanesPerBlock(icDiv4, blockCount, true);
+                        if (oc8Sg4K2FitsBudget && oc16Sg4K1Window && 4 * oc16Sg4K1Threadgroups >= tgBudget) {
+                            lanesPerBlock = 4;
+                        } else if (oc16Sg4K1ExceedsLimit && gpuTier.proTier) {
+                            lanesPerBlock = gemvSplitKFillLanes(blockCount);
+                        }
+                        lanesPerBlock = gemvCacheLineLanes(icDiv4, blockCount, mDequantBits, lanesPerBlock);
                         auto keys = baseKeys;
                         keys.emplace_back("conv1x1_gemv_g4m1_2sg_wquant_sg");
-                        keys.emplace_back("SPLIT_K_2");
-                        // Split-K halves the blocks a simdgroup owns, so the
-                        // lane split is re-chosen for that pipeline.
-                        const int skMid = q4W16 ? chooseQ4W16Mid(blockSize / 2, q4W16BlockSlices / 2) : 0;
-                        if (q4W16) {
-                            keys.emplace_back("W16_SK_MID_" + std::to_string(skMid));
+                        keys.emplace_back("oc8Sg4K2");
+                        if (lanesPerBlock > 0) {
+                            keys.emplace_back("lpb" + std::to_string(lanesPerBlock));
                         }
                         auto pipeline = rt->findPipeline(keys);
                         if (nil == pipeline) {
                             NSMutableDictionary *skDic = [dic mutableCopy];
-                            [skDic setValue:@"1" forKey:@"SPLIT_K_2"];
-                            if (q4W16) {
-                                [skDic setValue:@(skMid).stringValue forKey:@"GEMV_QBLOCK_W16_MID"];
+                            [skDic setValue:@"2" forKey:@"GEMV_QUADS_PER_TG"];
+                            [skDic setValue:@"2" forKey:@"GEMV_SPLIT_K"];
+                            if (lanesPerBlock > 0) {
+                                [skDic setValue:@(std::to_string(lanesPerBlock).c_str())
+                                         forKey:@"GEMV_LANES_PER_BLOCK"];
                             }
                             MTLCompileOptions *skOption = [[MTLCompileOptions alloc] init];
                             skOption.preprocessorMacros = skDic;
                             pipeline = backend->makeComputePipelineWithSourceOption(sgrWqStr.c_str(), "conv1x1_gemv_g4m1_2sg_wquant_sg", skOption);
                             rt->insertPipeline(keys, pipeline);
                         }
-                        mPipeline = pipeline; CONV1X1_SET_TAG("splitk2_gemv_g4m1_2sg_wquant_sg");
-                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 8), 1, 1), MTLSizeMake(128, 1, 1));
+                        mPipeline = pipeline;
+                        CONV1X1_SET_TAG("splitk2_gemv_g4m1_2sg_wquant_sg");
+                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 8), 1, 1),
+                                                  MTLSizeMake(128, 1, 1));
                     } else {
+                        const bool useOc16Sg4K1 = (oc % 16 == 0) &&
+                                                  (quadsPerBlock >= 32 || gpuTier.belowM4Gen);
+                        const int tgQuads = useOc16Sg4K1 ? 4 : 2;
+                        const int plainLanes = gemvPlainLanesPerBlock(icDiv4, blockCount, mDequantBits);
                         auto keys = baseKeys;
                         keys.emplace_back("conv1x1_gemv_g4m1_2sg_wquant_sg");
+                        if (useOc16Sg4K1) {
+                            keys.emplace_back("oc16Sg4K1");
+                        }
+                        if (plainLanes > 0) {
+                            keys.emplace_back("lpb" + std::to_string(plainLanes));
+                        }
                         auto pipeline = rt->findPipeline(keys);
                         if (nil == pipeline) {
-                            pipeline = backend->makeComputePipelineWithSourceOption(sgrWqStr.c_str(), "conv1x1_gemv_g4m1_2sg_wquant_sg", option);
+                            if (useOc16Sg4K1 || plainLanes > 0) {
+                                NSMutableDictionary *dic4 = [dic mutableCopy];
+                                if (useOc16Sg4K1) {
+                                    [dic4 setValue:@"4" forKey:@"GEMV_QUADS_PER_TG"];
+                                }
+                                if (plainLanes > 0) {
+                                    [dic4 setValue:@(std::to_string(plainLanes).c_str())
+                                            forKey:@"GEMV_LANES_PER_BLOCK"];
+                                }
+                                MTLCompileOptions *opt4 = [[MTLCompileOptions alloc] init];
+                                opt4.preprocessorMacros = dic4;
+                                pipeline = backend->makeComputePipelineWithSourceOption(sgrWqStr.c_str(), "conv1x1_gemv_g4m1_2sg_wquant_sg", opt4);
+                            } else {
+                                pipeline = backend->makeComputePipelineWithSourceOption(sgrWqStr.c_str(), "conv1x1_gemv_g4m1_2sg_wquant_sg", option);
+                            }
                             rt->insertPipeline(keys, pipeline);
                         }
                         mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-                        // 2 simdgroups per threadgroup, each handles 4 OC independently
-                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 8), 1, 1), MTLSizeMake(64, 1, 1));
+                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 4 * tgQuads), 1, 1),
+                                                  MTLSizeMake(32 * tgQuads, 1, 1));
                     }
-                    // Fusion leaders (gate/up, qkv, LN) build their own 2sg-based
-                    // pipelines and force a 64-thread dispatch in their setup.
+                    // Fusion leaders build their own 2sg-based pipelines and force a
+                    // 64-thread dispatch in their setup.
                     mIs2sgDecode = true;
                 } else {
+                    // All-area fallback for gemvAllArea shapes beyond the g4mN range.
                     auto keys = baseKeys;
                     keys.emplace_back("conv1x1_gemv_g8_wquant_sg");
                     auto pipeline = rt->findPipeline(keys);
@@ -918,18 +1302,18 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                         rt->insertPipeline(keys, pipeline);
                     }
                     mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-//                    MNN_PRINT("g8  ic: %d oc: %d\n", input->channel(), oc);
                     mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 8), area, 1), MTLSizeMake(128, 1, 1));
                 }
                 return NO_ERROR;
-            } else if(rt->supportSimdGroupMatrix()  && area > short_seq && oc > 8 && (ic_4 % 8 == 0 || ic_4 % 2 == 0)) {
+            } else if(rt->supportSimdGroupMatrix()  && area > short_seq && oc > 8 && (icDiv4 % 8 == 0 || icDiv4 % 2 == 0)) {
                 baseKeys.emplace_back("conv1x1_wquant_sg_matrix");
                 std::string sgmWqStr = basicShaderPrefix + sgmWqShader;
 
                 // Generally threadgroup memory >= 16KB
                 auto smem_size = [[context device] maxThreadgroupMemoryLength];
-                // choose different tile for different computation
-                if(ic_4 % 8 != 0) {
+                // choose different tile for different computation; 16x16 and 32x64 step 8 quads per
+                // quant block, so other block sizes stay on 8x16.
+                if(icDiv4 % 8 != 0 || !blockFitsQuads(8)) {
                     auto keys = baseKeys;
                     keys.emplace_back("conv1x1_gemm_8x16_wquant_sg");
                     auto pipeline = rt->findPipeline(keys);
@@ -970,36 +1354,6 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                     }
                     mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
                     mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, 16), UP_DIV(oc, 32), 1), MTLSizeMake(32, 1, 1));
-                } else if(area < 16) {
-                    // TODO: define useMatrix more accurate
-                    bool useMatrix = area > 6 && oc > 2048 && ic*2 < oc;
-                    if(useMatrix) {
-                        auto keys = baseKeys;
-                        int oc_block = (oc > 4096) ? 32 : 16;
-                        std::string kernel_name = "conv1x1_gemm_8x" + std::to_string(oc_block) + "_wquant_sg";
-
-                        keys.emplace_back(kernel_name);
-                        auto pipeline = rt->findPipeline(keys);
-                        if (nil == pipeline) {
-                            pipeline = backend->makeComputePipelineWithSourceOption(sgmWqStr.c_str(), kernel_name.c_str(), option);
-                            rt->insertPipeline(keys, pipeline);
-                        }
-                        mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, 8), UP_DIV(oc, oc_block), 1), MTLSizeMake(32, 1, 1));
-                    } else {
-                        std::string sgrWqStr = basicShaderPrefix + sgrWqShader;
-
-                        auto keys = baseKeys;
-                        std::string kernel_name = "conv1x1_gemv_g4m" + std::to_string(area) + "_wquant_sg";
-                        keys.emplace_back(kernel_name);
-                        auto pipeline = rt->findPipeline(keys);
-                        if (nil == pipeline) {
-                            pipeline = backend->makeComputePipelineWithSourceOption(sgrWqStr.c_str(), kernel_name.c_str(), option);
-                            rt->insertPipeline(keys, pipeline);
-                        }
-                        mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-                        mThreads = std::make_pair(MTLSizeMake(UP_DIV(oc, 4), 1, 1), MTLSizeMake(32, 1, 1));
-                    }
                 } else {
                     auto keys = baseKeys;
                     keys.emplace_back("conv1x1_gemm_16x16_wquant_sg");
@@ -1009,7 +1363,6 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                         rt->insertPipeline(keys, pipeline);
                     }
                     mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-//                                    MNN_PRINT("gemm M: %d N: %d\n", area, oc);
                     mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, 16), UP_DIV(oc, 16), 1), MTLSizeMake(32, 1, 1));
                 }
                 return NO_ERROR;
@@ -1020,9 +1373,7 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                 mPipeline = [context pipelineWithName:@"conv1x1_g1z4_w8" fp16:backend->useFp16InsteadFp32()];
                 name = "conv1x1_g1z4_w8";
             } else {
-                // W_QUANT_2/3 without simdGroupReduce: no usable kernel exists
-                // (g1z4_w4/w8 would misread the packed 2/3-bit buffer, and the
-                // outer-dequant GEMM requires simdgroup matrix).
+                // W_QUANT_2/3 without simdGroupReduce: no usable kernel exists.
                 MNN_ERROR("metal W_QUANT_%d conv1x1 requires simdgroup reduce support!\n", mDequantBits);
                 return NOT_SUPPORT;
             }
@@ -1089,25 +1440,9 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             }
             option.preprocessorMacros = dic;
 
-            // Fused quant GEMM: the fused kernel unpacks quantized weights
-            // in-kernel, skipping both the dequant pre-pass dispatch and the
-            // mTempWeight allocation.
-            // Enabled when proven correct and profitable: W2/W3/W4/W8, tensor-API
-            // capable device, prefill (area >= 64), or a speculative block (else a
-            // block-sized decode re-dequantizes the whole weight every encode).
-            // MNN_METAL_W4W8_OUTER_DEQUANT_GEMM_TENSORAPI=1 forces the outer-dequant
-            // baseline instead (A/B + emergency rollback; see
-            // skills/metal-optimize/env-registry.md).
-            // W3 is additionally gated by weight size: its 6-scalar-load +
-            // hi-mask unpack costs more ALU per M-tile than W2/W4's wide loads,
-            // which goes net-negative when fp16 layer weights stay L2-resident
-            // (M5: 0.6B W3 pp2048 fused -3.6% both orders, pp512 neutral) but
-            // wins once weights exceed L2 (4B W3 +10~11% pp512/pp2048). 4M
-            // elements ~ fp16 8MB, same boundary as the in-shader dequant gate;
-            // splits the calibrated points (0.6B max conv 3.1M, 4B min 6.5M).
-            auto specMeta = (KVMeta *)backend->getMetaPtr();
-            const bool specBlock = (specMeta != nullptr && specMeta->spec_block > 0);
-            const bool fusedQ4 = !MetalEnv::get().w4w8OuterDequantGemm &&
+            // Fused quant GEMM unpacks weights in-kernel, skipping the dequant
+            // pre-pass and mTempWeight; W3 is additionally gated by weight size.
+            const bool tensorApiFusedQuant =
                                  (mDequantBits == 2 || mDequantBits == 3 ||
                                   mDequantBits == 4 || mDequantBits == 8) &&
                                  backend->isSupportTensorApi() &&
@@ -1115,23 +1450,18 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                                  (mDequantBits != 3 ||
                                   (int64_t)oc * ic >= (int64_t)4 * 1024 * 1024);
 
-            // M_TILE=64 variant (requires tensor API — implicitly M5+).
-            // Measured on M5, Qwen3-4B, Metal fp16, 4 threads, 3-rep A/B:
-            //   pp512  M32 851 t/s  -> M64 901 t/s  (+5.9%)
-            //   pp2048 M32 715 t/s  -> M64 764 t/s  (+6.8%)
-            mFusedQ4M64 = fusedQ4 && mDequantBits == 4 && area >= 128;
+            // M_TILE=64 variant halves grid.x and DRAM weight traffic, trading
+            // higher register/smem pressure (needs tensor API).
+            mFusedQuantM64 = tensorApiFusedQuant &&
+                             (mDequantBits == 4 || mDequantBits == 8) && area >= 64;
 
-            mFusedQ4 = fusedQ4;
+            mTensorApiFusedQuant = tensorApiFusedQuant;
 
-            if (!fusedQ4) {
+            if (!tensorApiFusedQuant) {
                 int bytes = backend->useFp16InsteadFp32() ? 2 : 4;
                 const int tempSize = ROUND_UP(oc, 4) * ROUND_UP(ic, 32) * bytes;
-                // Size depends only on oc/ic/bytes, so create the Tensor once and
-                // keep the object for the execution's lifetime: a recorded
-                // encode-replay holds raw Tensor* to it, and destroying it would
-                // leave that recording dangling. Only the buffer range is
-                // acquired per resize; metalReplayValidate catches an address
-                // change on its own.
+                // Keep the Tensor object alive: encode-replay holds a raw
+                // pointer to it. Only the buffer range is reacquired per resize.
                 if (mTempWeight == nullptr || mTempWeight->elementSize() != tempSize) {
                     mTempWeight.reset(Tensor::createDevice<uint8_t>(std::vector<int>{tempSize}));
                 }
@@ -1156,44 +1486,62 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             auto keys = baseKeys;
             const char* gemmKernelName = "conv1x1_gemm_32x64_split_k_sg";
             bool sgMatrixM64 = false;
-            // K-split x4 recovers TG-starved speculative-verify shapes; TG-rich ones
-            // (lm_head) stay out. MNN_METAL_FUSED_Q4_KSPLIT: unset auto, =0 off, =1 on.
-            const auto& metalEnv = MetalEnv::get();
-            const bool fusedQ4SpecBlock = mFusedQ4 && mDequantPipeline == nil &&
-                                      mDequantBits == 4 && !mFusedQ4M64 && specBlock;
+            bool fusedQuantDoubleBuf = false;
+            // K-split x4 recovers TG-starved speculative-verify shapes.
+            const bool fusedQ4SpecBlock = mTensorApiFusedQuant && mDequantPipeline == nil &&
+                                      mDequantBits == 4 && !mFusedQuantM64 && specBlock;
             mUseFusedKsplit = false;
-            if (fusedQ4SpecBlock && metalEnv.fusedQ4Ksplit >= 0) {
-                mUseFusedKsplit = metalEnv.fusedQ4Ksplit == 1 ||
-                                  (area <= 32 && UP_DIV(oc, 64) <= 48 && blockSize >= 4);
+            mPrefillSiluOn = false;
+            mPrefillDualOn = false;
+            if (fusedQ4SpecBlock) {
+                mUseFusedKsplit = area <= 32 && UP_DIV(oc, 64) <= 48 && blockCount >= 4;
             }
-            // M8-native tile for small-M shapes the K-split gate skips (a padded M32
-            // tile runs at quarter occupancy). MNN_METAL_FUSED_Q4_M8=0 forces it off.
-            const bool useFusedM8 = fusedQ4SpecBlock && !mUseFusedKsplit &&
-                                    area > 1 && area <= 8 && metalEnv.fusedQ4M8 >= 0;
-            if (mFusedQ4) {
+            // M8-native tile for the small-M shapes the K-split gate skips.
+            const bool useFusedM8 = fusedQ4SpecBlock && !mUseFusedKsplit && area > 1 && area <= 8;
+            if (mTensorApiFusedQuant) {
                 if (mUseFusedKsplit) {
-                    // Stack the M8 tile on K-split when the block is narrow enough;
-                    // MNN_METAL_FUSED_Q4_KSPLIT_M8=0 keeps the M32 tile.
-                    mKsplitM8 = area <= 8 && metalEnv.fusedQ4KsplitM8 >= 0;
+                    // Stack the M8 tile on K-split when the block is narrow enough.
+                    mKsplitM8 = area <= 8;
                     gemmKernelName = mKsplitM8 ? "conv1x1_fused_q4_gemm_stage_ksplit_m8"
                                                : "conv1x1_fused_q4_gemm_stage_ksplit";
                     keys.emplace_back(gemmKernelName);
                 } else if (useFusedM8) {
                     gemmKernelName = "conv1x1_fused_q4_gemm_stage_m8";
                     keys.emplace_back("conv1x1_fused_q4_gemm_stage_m8");
-                } else if (mFusedQ4M64) {
+                } else if (mFusedQuantM64) {
                     gemmKernelName = "conv1x1_fused_q4_gemm_stage_m64";
-                    keys.emplace_back("conv1x1_fused_q4_gemm_stage_m64");
+                    keys.emplace_back(gemmKernelName);
+                    // Double-buffered operand staging: one barrier per K8 window.
+                    // fp16 only, fp32 would exceed the 32 KB threadgroup limit.
+                    fusedQuantDoubleBuf = backend->useFp16InsteadFp32();
+                    if (fusedQuantDoubleBuf) {
+                        keys.emplace_back("FQ_DOUBLE_BUF");
+                    }
+                    // Fold the group's MUL_SILU into this epilogue, gated by the
+                    // env-adjustable min area.
+                    mPrefillSiluOn = (mDequantBits == 4 || mDequantBits == 8) && nullptr != mPrefillSiluGate &&
+                                     area >= MetalEnv::get().fusedQ4GateUpDualMinArea;
+                    // The dual supersedes the fold: the gate tile stays in a second
+                    // accumulator and is never written.
+                    mPrefillDualOn = (mDequantBits == 4 || mDequantBits == 8) && nullptr != mPrefillDualPeer &&
+                                     area >= MetalEnv::get().fusedQ4GateUpDualMinArea;
+                    if (mPrefillDualOn) {
+                        mPrefillSiluOn = false;
+                        keys.emplace_back("FQ4_GATEUP_DUAL");
+                        if (nil == mPrefillDualCoef) {
+                            mPrefillDualCoef = backend->getConstBuffer(sizeof(float));
+                        }
+                        ((float *)mPrefillDualCoef.contents)[0] = mPrefillDualPeer->scaleCoef();
+                    } else if (mPrefillSiluOn) {
+                        keys.emplace_back("FQ4_SILU_MUL");
+                    }
                 } else {
                     gemmKernelName = "conv1x1_fused_q4_gemm_stage";
                     keys.emplace_back("conv1x1_fused_q4_gemm_stage");
                 }
-            } else if (!backend->isSupportTensorApi() &&
-                       ((MetalRuntime*)backend->runtime())->preferM64Gemm() && area >= 128) {
-                // sg_matrix M=64 tile, device-tiered via architecture.name
-                // (M4-class Macs only, see MetalBackend.mm; env removed 2026-07-31):
-                // halves grid.x / weight DRAM traffic; fp16 weights from the
-                // outer-dequant pre-pass, same bindings as the 32x64 kernel.
+            } else if (outerSgM64) {
+                // sg_matrix M=64 tile: halves grid.x and weight DRAM traffic, same
+                // bindings as the 32x64 kernel.
                 gemmKernelName = "conv1x1_gemm_64x64_split_k_sg";
                 keys.emplace_back("conv1x1_gemm_64x64_split_k_sg");
                 sgMatrixM64 = true;
@@ -1202,24 +1550,21 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             }
 
             NSMutableDictionary *dic = [baseDic mutableCopy];
-            if (ic_4 % 8 != 0) {
+            // The fused-stage K=32 tile spans 8 K4 groups.
+            if (icDiv4 % 8 != 0) {
                 [dic setValue:@"1" forKey:@"MNN_METAL_SRC_PROTECT"];
                 keys.emplace_back("MNN_METAL_SRC_PROTECT");
             }
             if(backend->isSupportTensorApi() == true) {
                 [dic setValue:@"1" forKey:@"USE_METAL_TENSOR_OPS"];
                 keys.emplace_back("USE_METAL_TENSOR_OPS");
-                if(ic > oc && ic > 2048 && (ic / blockSize) % 64 == 0 && !mFusedQ4) {
-                    // LOOP_K64 branch only exists for conv1x1_gemm_32x64_split_k_sg.
-                    // Fused-stage kernel is always K=32 tile.
+                if(ic > oc && ic > 2048 && (ic / blockCount) % 64 == 0 && !mTensorApiFusedQuant) {
+                    // LOOP_K64 only exists for conv1x1_gemm_32x64_split_k_sg.
                     [dic setValue:@"1" forKey:@"LOOP_K64"];
                     keys.emplace_back("LOOP_K64");
                 }
             }
-            // Fused-stage kernel is compiled with W_QUANT_{2,3,4,8}.
-            // (kernel body is guarded by `#if defined(W_QUANT_2) || defined(W_QUANT_3)
-            //  || defined(W_QUANT_4) || defined(W_QUANT_8)`).
-            if (mFusedQ4) {
+            if (mTensorApiFusedQuant) {
                 switch (mDequantBits) {
                     case 2:
                         [dic setValue:@"1" forKey:@"W_QUANT_2"];
@@ -1232,8 +1577,8 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                     case 4:
                         [dic setValue:@"1" forKey:@"W_QUANT_4"];
                         keys.emplace_back("W_QUANT_4");
-                        // The M8/K-split kernels are guarded by W_QUANT_4 && FUSED_Q4_REAL_UNPACK;
-                        // without the macro the library compiles but pipeline lookup finds no function.
+                        // The M8/K-split kernels are guarded by W_QUANT_4 &&
+                        // FUSED_Q4_REAL_UNPACK.
                         [dic setValue:@"1" forKey:@"FUSED_Q4_REAL_UNPACK"];
                         keys.emplace_back("FUSED_Q4_REAL_UNPACK");
                         break;
@@ -1242,6 +1587,15 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                         keys.emplace_back("W_QUANT_8");
                         break;
                 }
+            }
+            if (fusedQuantDoubleBuf) {
+                [dic setValue:@"1" forKey:@"FQ_DOUBLE_BUF"];
+            }
+            if (mPrefillSiluOn) {
+                [dic setValue:@"1" forKey:@"FQ4_SILU_MUL"];
+            }
+            if (mPrefillDualOn) {
+                [dic setValue:@"1" forKey:@"FQ4_GATEUP_DUAL"];
             }
             option.preprocessorMacros = dic;
 
@@ -1252,8 +1606,7 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             }
             mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
             if (mUseFusedKsplit) {
-                // grid gains z=4 K-partitions; the reduce pass sums the fp32
-                // partials and applies bias + activation.
+                // grid gains z=4 K-partitions; the reduce pass sums the partials.
                 mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, mKsplitM8 ? 8 : 32), UP_DIV(oc, 64), 4), MTLSizeMake(128, 1, 1));
                 auto rkeys = keys;
                 rkeys.emplace_back("conv1x1_fused_q4_ksplit_reduce");
@@ -1263,17 +1616,19 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                     rt->insertPipeline(rkeys, rpipeline);
                 }
                 mKsplitReducePipeline = rpipeline;
-                // fp32 partials [KS=4, oc_4, area, 4] = 4 * oc_4 * area * 16 bytes.
-                int totalOut = oc_4 * area;
+                // fp32 partials [KS=4, ocDiv4, area, 4] = 4 * ocDiv4 * area * 16 bytes.
+                int totalOut = ocDiv4 * area;
                 mKsplitPartial.reset(Tensor::createDevice<uint8_t>(std::vector<int>{4 * totalOut * 16}));
                 backend->onAcquireBuffer(mKsplitPartial.get(), Backend::DYNAMIC);
                 backend->onReleaseBuffer(mKsplitPartial.get(), Backend::DYNAMIC);
                 mKsplitReduceThreads = std::make_pair(MTLSizeMake(UP_DIV(totalOut, 128), 1, 1), MTLSizeMake(128, 1, 1));
             } else {
-                const int mTile = useFusedM8 ? 8 : ((mFusedQ4M64 || sgMatrixM64) ? 64 : 32);
-                mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, mTile), UP_DIV(oc, 64), 1), MTLSizeMake(128, 1, 1));
+                const int mTile = useFusedM8 ? 8 : ((mFusedQuantM64 || sgMatrixM64) ? 64 : 32);
+                // The dual halves N per matrix, so it needs twice the N tiles.
+                const int nTile = mPrefillDualOn ? 32 : 64;
+                mThreads = std::make_pair(MTLSizeMake(UP_DIV(area, mTile), UP_DIV(oc, nTile), 1),
+                                          MTLSizeMake(128, 1, 1));
             }
-            //printf("out dequant MNK: %d %d %d %d\n", area, oc, ic, blockSize);
         }
 
         return NO_ERROR;
@@ -1286,9 +1641,10 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
 
         baseKeys.emplace_back("conv1x1_float_sg_matrix");
         // total computation not too small
-        if(area >= 16 && ic_4 >= 4 && ic_4 % 2 == 0 && oc_4 >= 4 && area * ic_4 * oc_4 >= 64 * 64 * 64) {
+        if(area >= 16 && icDiv4 >= 4 && icDiv4 % 2 == 0 && ocDiv4 >= 4 &&
+           (int64_t)area * icDiv4 * ocDiv4 >= 64 * 64 * 64) {
             // Enough threads
-            if(area * oc_4 / ic_4 >= 1024) {
+            if((int64_t)area * ocDiv4 / icDiv4 >= 1024) {
                 auto keys = baseKeys;
                 keys.emplace_back("conv1x1_gemm_32x16_sg");
                 auto pipeline = rt->findPipeline(keys);
@@ -1318,7 +1674,7 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
         baseKeys.emplace_back("conv1x1_float_sg_reduce");
         // do input_channel reduce
         auto magic_num = 4.0; // total threads pretty small and loop pretty large
-        if(ic_4 >= 32 && ic_4 % 2 == 0 && 1.0 * area * oc_4 / ic_4 < magic_num) {
+        if(icDiv4 >= 32 && icDiv4 % 2 == 0 && 1.0 * area * ocDiv4 / icDiv4 < magic_num) {
             auto keys = baseKeys;
             keys.emplace_back("conv1x1_z4_sg");
             auto pipeline = rt->findPipeline(keys);
@@ -1327,15 +1683,14 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                 rt->insertPipeline(keys, pipeline);
             }
             mPipeline = pipeline; CONV1X1_SET_TAG(keys.back());
-            mThreads = std::make_pair(MTLSizeMake(ow * oh, oc_4, ob), MTLSizeMake(32, 1, 1));
+            mThreads = std::make_pair(MTLSizeMake(ow * oh, ocDiv4, ob), MTLSizeMake(32, 1, 1));
             return NO_ERROR;
         }
     }
-//    printf("lora: %d %d %d %d %d\n", ob, oh, ow, oc, input->channel());
     if(rt->getTuneLevel() == Never) {
         if (ow * oh >= 128) {
             NSUInteger gid_x = UP_DIV(ow * oh, 8);
-            NSUInteger gid_y = oc_4;
+            NSUInteger gid_y = ocDiv4;
             NSUInteger gid_z = ob;
 
             mPipeline = [context pipelineWithName:@"conv1x1_g1z8" fp16:backend->useFp16InsteadFp32()];
@@ -1354,7 +1709,7 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             CONV1X1_SET_TAG(name);
         } else {
             NSUInteger gid_x = UP_DIV(ow * oh, 4);
-            NSUInteger gid_y = oc_4;
+            NSUInteger gid_y = ocDiv4;
             NSUInteger gid_z = ob;
 
             mPipeline = [context pipelineWithName:@"conv1x1_g1z4" fp16:backend->useFp16InsteadFp32()];
@@ -1370,14 +1725,13 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
             auto ret = [context getGridAndThreadgroup:mPipeline gid:MTLSizeMake(gid_x, gid_y, gid_z) loop:10 buffer:arr runtime:rt shaderName:name offsets: buffer_offset queue:backend->queue()];
             mThreads = std::make_pair(std::get<0>(ret), std::get<1>(ret));
             CONV1X1_SET_TAG(name);
-            //printf("conv1x1_z4, %d %d %d %d\n", ow, oh, oc_4, ic_4);
         }
     } else {
         NSString* shaderName[] = {@"conv1x1_g1z8", @"conv1x1_g1z4", @"conv1x1_w4h4",  @"conv1x1_w2c2", @"conv1x1_w4c2"};
         int itemW[] = {8, 4, 16, 2, 4};
         int itemC[] = {4, 4, 4, 8, 8};
         int actual_kernel = 5;
-        if (oc_4 % 2 != 0) {
+        if (ocDiv4 % 2 != 0) {
             // Don't unrool c for avoid memory exceed
             actual_kernel = 3;
         }
@@ -1404,9 +1758,7 @@ ErrorCode MetalConvolution1x1::onResize(const std::vector<Tensor *> &inputs, con
                 min_cost.second = knl_idx;
                 mThreads = std::make_pair(std::get<0>(ret), std::get<1>(ret));
             }
-            //printf("conv1x1 idx:%d, global:%d %d %d, local:%d %d %d, min_cost:%d\n", knl_idx, (int)retTune.second.first.width, (int)retTune.second.first.height, (int)retTune.second.first.depth, (int)retTune.second.second.width, (int)retTune.second.second.height, (int)retTune.second.second.depth, (int)retTune.first);
         }
-        //printf("conv1x1 idx:%d, min_cost:%d\n", (int)min_cost.second, (int)min_cost.first);
         mPipeline = [context pipelineWithName:shaderName[min_cost.second] fp16:backend->useFp16InsteadFp32()];
         CONV1X1_SET_TAG(std::string([shaderName[min_cost.second] UTF8String]));
     }
@@ -1430,8 +1782,6 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
         return;
     }
 #if MNN_METAL_OP_PROFILE
-    // Report kernel-variant tag so the profile output can distinguish shader paths
-    // (e.g. Convolution/gemm_32x64_split_k_sg vs Convolution/gemv_g4m1_2sg_wquant_sg).
     {
         std::string subtag = mProfileTag;
         if (mIsGateUpLeader) {
@@ -1456,8 +1806,12 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
             auto inTensor = mHasLNFusion ? mLNHiddenInput : input;
             [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)inTensor->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(inTensor)->offset atIndex:0];
         }
-        // buffer(1): gate output (this)
-        [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)output->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(output)->offset atIndex:1];
+        // buffer(1): gate output, or the group's SwiGLU output when the epilogue
+        // folds MUL_SILU in
+        {
+            auto outTensor = mGateUpSilu ? mGateUpSiluOutput : output;
+            [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)outTensor->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(outTensor)->offset atIndex:1];
+        }
         // buffer(2): gate params (also used by up since dimensions are identical)
         [encoder setBuffer:mConstBuffer offset:0 atIndex:2];
         // buffer(3): gate weight
@@ -1493,29 +1847,43 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
         }
         // buffer(1): q output (this)
         [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)output->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(output)->offset atIndex:1];
-        // buffer(2): q params (input dims shared; k/v output_slice via seg)
+        // buffer(2): q params (input dims shared; k/v outputDepthQuad via seg)
         [encoder setBuffer:mConstBuffer offset:0 atIndex:2];
-        MetalBackend::setTensor(mWeight.get(), encoder, 3);
+        if (mQKVMergedBuffer != nil) {
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[0] atIndex:3];
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[4] atIndex:5];
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[1] atIndex:7];
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[5] atIndex:9];
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[2] atIndex:11];
+            [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[6] atIndex:13];
+        } else {
+            MetalBackend::setTensor(mWeight.get(), encoder, 3);
+            MetalBackend::setTensor(getDequantScale().get(), encoder, 5);
+            MetalBackend::setTensor(mQKVPeerK->getWeight().get(), encoder, 7);
+            MetalBackend::setTensor(mQKVPeerK->getDequantScale().get(), encoder, 9);
+            MetalBackend::setTensor(mQKVPeerV->getWeight().get(), encoder, 11);
+            MetalBackend::setTensor(mQKVPeerV->getDequantScale().get(), encoder, 13);
+        }
         MetalBackend::setTensor(mBias.get(), encoder, 4);
-        MetalBackend::setTensor(getDequantScale().get(), encoder, 5);
         // buffers(6-9): k projection
         MetalBackend::setTensor(mQKVPeerKOutput, encoder, 6);
-        MetalBackend::setTensor(mQKVPeerK->getWeight().get(), encoder, 7);
         MetalBackend::setTensor(mQKVPeerK->getBias().get(), encoder, 8);
-        MetalBackend::setTensor(mQKVPeerK->getDequantScale().get(), encoder, 9);
         // buffers(10-13): v projection
         MetalBackend::setTensor(mQKVPeerVOutput, encoder, 10);
-        MetalBackend::setTensor(mQKVPeerV->getWeight().get(), encoder, 11);
         MetalBackend::setTensor(mQKVPeerV->getBias().get(), encoder, 12);
-        MetalBackend::setTensor(mQKVPeerV->getDequantScale().get(), encoder, 13);
-        // buffer(14): {k_coef, v_coef, k_oslice, v_oslice[, w_coef, w_oslice]}
+        // buffer(14): {k_coef, v_coef, kOutQuad, vOutQuad[, w_coef, wOutQuad]}
         [encoder setBuffer:mQKVSegBuffer offset:0 atIndex:14];
         // buffers(15-18): optional 4th projection (QKV_FUSED_P4)
         if (mQKVPeerW != nullptr && mQKVPeerWOutput != nullptr) {
             MetalBackend::setTensor(mQKVPeerWOutput, encoder, 15);
-            MetalBackend::setTensor(mQKVPeerW->getWeight().get(), encoder, 16);
             MetalBackend::setTensor(mQKVPeerW->getBias().get(), encoder, 17);
-            MetalBackend::setTensor(mQKVPeerW->getDequantScale().get(), encoder, 18);
+            if (mQKVMergedCount == 4) {
+                [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[3] atIndex:16];
+                [encoder setBuffer:mQKVMergedBuffer offset:mQKVMergedOff[7] atIndex:18];
+            } else {
+                MetalBackend::setTensor(mQKVPeerW->getWeight().get(), encoder, 16);
+                MetalBackend::setTensor(mQKVPeerW->getDequantScale().get(), encoder, 18);
+            }
         }
         if (mHasLNFusion) {
             bindLNBuffers(encoder);
@@ -1524,9 +1892,8 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
         return;
     }
 
-    // Plain single-conv LN fusion (merged gate/up projection consumers): the
-    // standalone LN_FUSED kernel variant computes RMSNorm in-kernel; no
-    // leader/follower pairing involved.
+    // Plain single-conv LN fusion: the standalone LN_FUSED kernel computes RMSNorm
+    // in-kernel, no leader/follower pairing.
     if (mHasLNFusion && !mIsGateUpLeader && nil != mLNFusedPipeline && mLNHiddenInput != nullptr) {
         [encoder setComputePipelineState:mLNFusedPipeline];
         [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)mLNHiddenInput->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(mLNHiddenInput)->offset atIndex:0];
@@ -1541,17 +1908,13 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
     }
 
     if(mPreDequantWeight) {
-        // Fused path: mDequantPipeline is nil and mTempWeight was never
-        // allocated. Dispatch only the fused GEMM which reads quantized weight
-        // from buffer(3) directly. buffer(6) is bound to mWeight as a harmless
-        // alias — the fused kernel body never reads buffer(6), but
-        // binding *something* keeps the Metal validation layer happy in debug
-        // builds.
-        const bool fused = (mDequantPipeline == nil) && mFusedQ4;
+        // Fused path: mDequantPipeline is nil, so dispatch only the fused GEMM which
+        // reads quantized weight from buffer(3) directly.
+        const bool fused = (mDequantPipeline == nil) && mTensorApiFusedQuant;
 
 #if MNN_METAL_OP_PROFILE
-        // In profile mode, split the two sub-passes (weight dequant + gemm) into
-        // independent command buffers so each shows up as its own profile row.
+        // Split the two sub-passes into independent command buffers so each shows up
+        // as its own profile row.
         if (!fused) {
             static_cast<MetalBackend*>(backend())->setProfileSubtag("outdeq_wdq");
         }
@@ -1583,8 +1946,8 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
             [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)output->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(output)->offset atIndex:1];
             [encoder setBuffer:mConstBuffer offset:0 atIndex:2];
             if (mUseFusedKsplit) {
-                // Two-pass: the ksplit GEMM writes fp32 partials over buffer(1); the
-                // reduce pass sums them, adds bias/activation, writes the real output.
+                // Two-pass: the ksplit GEMM writes fp32 partials, the reduce pass sums
+                // them into the real output.
                 MetalBackend::setTensor(mKsplitPartial.get(), encoder, 1);
                 MetalBackend::setTensor(mWeight.get(), encoder, 3);
                 MetalBackend::setTensor(mBias.get(), encoder, 4);
@@ -1600,34 +1963,32 @@ void MetalConvolution1x1::onEncode(const std::vector<Tensor *> &inputs, const st
                 [encoder dispatchThreadgroups:mKsplitReduceThreads.first threadsPerThreadgroup:mKsplitReduceThreads.second];
                 return;
             }
-            if (mFusedQ4) {
-                // Fused kernel bindings: buffer(3) = quantized weight,
-                // buffer(4) = bias, buffer(5) = dequantScale, buffer(6) =
-                // placeholder alias of mWeight (never read by the fused
-                // kernel; mTempWeight is not allocated).
+            if (mTensorApiFusedQuant) {
+                // buffer(6) is a placeholder alias of mWeight, never read by the fused
+                // kernel.
                 MetalBackend::setTensor(mWeight.get(), encoder, 3);
                 MetalBackend::setTensor(mBias.get(), encoder, 4);
                 MetalBackend::setTensor(getDequantScale().get(), encoder, 5);
                 MetalBackend::setTensor(mWeight.get(), encoder, 6);
+                if (mPrefillDualOn) {
+                    // Peer (gate) operands mirror 3/4/5 at 7/8/9, with the gate's own
+                    // scale coefficient at 10.
+                    MetalBackend::setTensor(mPrefillDualPeer->getWeight().get(), encoder, 7);
+                    MetalBackend::setTensor(mPrefillDualPeer->getBias().get(), encoder, 8);
+                    MetalBackend::setTensor(mPrefillDualPeer->getDequantScale().get(), encoder, 9);
+                    [encoder setBuffer:mPrefillDualCoef offset:0 atIndex:10];
+                } else if (mPrefillSiluOn) {
+                    MetalBackend::setTensor(mPrefillSiluGate, encoder, 7);
+                }
             } else {
-                // Legacy conv1x1_gemm_32x64_split_k_sg: buffer(3)=fp16 dequanted
-                // weight (mTempWeight), buffer(5)=dequantScale (used for LOOP_K64
-                // W_QUANT_4/8 variants only).
+                // Legacy conv1x1_gemm_32x64_split_k_sg: buffer(3) is the dequanted
+                // weight (mTempWeight).
                 MetalBackend::setTensor(mTempWeight.get(), encoder, 3);
                 MetalBackend::setTensor(mBias.get(), encoder, 4);
                 MetalBackend::setTensor(getDequantScale().get(), encoder, 5);
             }
             [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
         }
-    } else if (mUseFusedDecode) {
-        // Fused weight+scale decode path: single buffer contains interleaved scale/bias/weights
-        [encoder setComputePipelineState:mPipeline];
-        [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)input->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(input)->offset atIndex:0];
-        [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)output->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(output)->offset atIndex:1];
-        [encoder setBuffer:mConstBuffer offset:0 atIndex:2];
-        MetalBackend::setTensor(mFusedWeightScale.get(), encoder, 3);
-        MetalBackend::setTensor(mBias.get(), encoder, 4);
-        [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
     } else {
         [encoder setComputePipelineState:mPipeline];
         [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)input->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(input)->offset atIndex:0];

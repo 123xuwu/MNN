@@ -158,7 +158,9 @@ struct softmax_shape {
     int outside_size;
     int axis_align_length;
     // CAUSAL_BOUND only: outside is [B*H, q_piece]; row q_local = gid.y % q_piece_len
-    // has valid prefix length min(axis_length, causal_base + q_local).
+    // has valid prefix length min(axis_length, causal_base + q_local). causal_base
+    // is piece-independent -- the q-split offset arrives per dispatch in seq_idx,
+    // since one shared buffer serves every piece in a command buffer.
     int q_piece_len;
     int causal_base;
 };
@@ -167,6 +169,9 @@ struct softmax_shape {
 kernel void softmax_plane(const device ftype *in [[buffer(0)]],
                           device ftype *out [[buffer(1)]],
                           constant softmax_shape& s [[buffer(2)]],
+#ifdef CAUSAL_BOUND
+                          constant int& seq_idx [[buffer(3)]],
+#endif
                           uint2 gid [[thread_position_in_grid]]) {
     if ((int)gid.x >= s.inside_size || (int)gid.y >= s.outside_size) return;
     // Use long for the outer offset: for LLM attention softmax at 24K+ seq,
@@ -176,21 +181,14 @@ kernel void softmax_plane(const device ftype *in [[buffer(0)]],
     auto axis_in  = in + in_offset;
     auto axis_out = out + out_offset;
 #ifdef CAUSAL_BOUND
-    // Causal prefill: rows only attend to the valid prefix; the upper-triangle
-    // region of the QK output is neither read nor written here. Zero-pad past
-    // the valid prefix so that AV in prefill_qkv can read the tile boundary
-    // safely without touching stale memory beyond the softmax write.
-    //
-    // The pad end is rounded up to a 32-scalar boundary so both tile shapes
-    // are safe:
-    //   * non-tensor prefill_qkv: tile M=16, K=8; needs pad >= 16 rows worth
-    //     of zeros past the last row's valid_len.
-    //   * tensor prefill_qkv: tile M=32, K=32; the 32-row tile has
-    //     max_valid - min_valid = 31 in a single tile and reads a K=32 tile
-    //     at a time — the pad must be >= 32 and 32-aligned so av_k_upper can
-    //     be picked to satisfy X <= min_pad_end for every row in the tile.
+    // Causal prefill: rows only attend to the valid prefix, so the QK upper triangle is
+    // neither read nor written. Zero-pad past the prefix so AV in prefill_qkv can read
+    // the tile boundary without touching stale memory. The pad end rounds up to 32
+    // scalars to cover both tile shapes: non-tensor (M=16, K=8) needs 16 rows of zeros
+    // past the last valid_len, tensor (M=32, K=32) needs >= 32 and 32-aligned so
+    // av_k_upper holds for every row in the tile.
     int q_local = (int)gid.y % s.q_piece_len;
-    int valid_len = min(s.axis_length, s.causal_base + q_local);
+    int valid_len = min(s.axis_length, s.causal_base + seq_idx * s.q_piece_len + q_local);
     int pad_end = min(s.axis_align_length, ((valid_len + 32 + 31) / 32) * 32);
 #else
     int valid_len = s.axis_length;
@@ -212,6 +210,9 @@ kernel void softmax_plane(const device ftype *in [[buffer(0)]],
 kernel void softmax_plane_sg(const device ftype *in     [[buffer(0)]],
                         device ftype *out          [[buffer(1)]],
                         constant softmax_shape& s   [[buffer(2)]],
+#ifdef CAUSAL_BOUND
+                        constant int& seq_idx       [[buffer(3)]],
+#endif
                         uint2 gid[[threadgroup_position_in_grid]],
                         uint  tiisg[[thread_index_in_simdgroup]],
                         uint  sgitg[[simdgroup_index_in_threadgroup]]
@@ -223,7 +224,7 @@ kernel void softmax_plane_sg(const device ftype *in     [[buffer(0)]],
     auto axis_out = out + out_offset;
 #ifdef CAUSAL_BOUND
     int q_local = (int)gid.y % s.q_piece_len;
-    int valid_len = min(s.axis_length, s.causal_base + q_local);
+    int valid_len = min(s.axis_length, s.causal_base + seq_idx * s.q_piece_len + q_local);
     // Pad past valid to a 32-scalar boundary (see softmax_plane comment above
     // for why 32-aligned +32 is required to keep both M=16 and M=32 prefill_qkv
     // tiles safe).
