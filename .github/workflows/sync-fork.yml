@@ -60,7 +60,7 @@ jobs:
 
           cp -a .github .github_backup
 
-          git merge --no-commit upstream/master
+          git merge --no-commit --no-ff upstream/master
 
           rm -rf .github
           mv .github_backup .github
