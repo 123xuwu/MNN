@@ -60,7 +60,18 @@ jobs:
 
           cp -a .github .github_backup
 
-          git merge --no-commit --no-ff upstream/master
+          if ! git merge --no-commit --no-ff upstream/master; then
+            echo '出现合并冲突，按策略解决：.github 保留本地，其他取上游'
+          fi
+
+          git ls-files --unmerged | awk '{print $4}' | sort -u | while IFS= read -r f; do
+            if [[ "$f" == .github/* ]]; then
+              git checkout --ours -- "$f" 2>/dev/null || git checkout --theirs -- "$f" 2>/dev/null || true
+            else
+              git checkout --theirs -- "$f" 2>/dev/null || git checkout --ours -- "$f" 2>/dev/null || true
+            fi
+            git add -- "$f"
+          done
 
           rm -rf .github
           mv .github_backup .github
