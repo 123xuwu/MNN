@@ -92,7 +92,7 @@ jobs:
         id: push_branch
         if: steps.upstream_check.outputs.upstream_ahead == 'true' && steps.merge_changes.outputs.has_changes == 'true'
         run: |
-          SYNC_BRANCH="sync-upstream-sync-20261124012909"
+          SYNC_BRANCH="sync-upstream-sync-20261124013015"
           # 避免与仓库中 sync-upstream/ 前缀目录发生 refs 冲突
           git checkout -B "$SYNC_BRANCH"
           git push origin -f HEAD:refs/heads/"$SYNC_BRANCH"
